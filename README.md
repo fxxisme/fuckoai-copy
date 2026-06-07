@@ -15,13 +15,14 @@ Linux 容器版注册控制面板。
 server.py                  # 本地 API 和 Web 控制面板服务
 control_panel.html         # Linux Web 控制面板
 uc_signup.py               # Linux 浏览器自动注册脚本
-config.json                # 应用配置默认值
+config.example.json        # 应用配置模板
+config.json                # 本地应用配置，不进入 git
 Dockerfile                 # Linux 容器镜像
 docker-compose.yml         # fuckoai 服务
 scripts/start_linux_vnc.sh # Xvfb/VNC/noVNC + server 启动脚本
 ```
 
-运行数据放在 `data/`，`.env` 和 `data/` 不进入 git，也不进入 Docker build context。
+运行数据放在 `data/`，`.env`、`config.json` 和 `data/` 不进入 git，也不进入 Docker build context。
 
 ## 配置
 
@@ -33,7 +34,13 @@ ADMIN_PASSWORD=你的控制面板管理员密码
 
 `ADMIN_PASSWORD` 可选；设置后访问 `/ui` 需要登录。
 
-其他设置写在 `config.json`，也可以在控制面板“设置”页保存。仓库默认 `config.json` 已包含 HeroSMS 接口地址、注册资料默认值和浏览器参数；接口密钥、临时邮箱、CPA 等用户配置默认为空。
+其他设置写在本地 `config.json`，也可以在控制面板“设置”页保存。首次部署可以从模板创建：
+
+```bash
+cp config.example.json config.json
+```
+
+模板已包含 HeroSMS 接口地址、注册资料默认值和浏览器参数；接口密钥、临时邮箱、CPA 等用户配置默认为空。
 
 ## 购买配置
 
