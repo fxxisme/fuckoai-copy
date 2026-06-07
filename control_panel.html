@@ -183,6 +183,29 @@
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 10px;
     }
+    .group-list { display: grid; gap: 12px; }
+    .purchase-group {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fbfcfe;
+    }
+    .group-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .group-title { font-weight: 650; }
+    .inline-check {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .inline-check input { width: auto; }
     .login {
       position: fixed;
       inset: 0;
@@ -362,6 +385,17 @@
         </section>
         <section>
           <h3>购买设置</h3>
+          <div class="row" style="margin-bottom:10px">
+            <button id="addPurchaseGroupBtn" class="primary">新增设置组</button>
+            <button id="loadPurchaseGroupsBtn">加载设置组</button>
+            <button id="savePurchaseGroupsBtn">保存设置组</button>
+            <button id="refreshCountriesBtn">刷新国家缓存</button>
+          </div>
+          <p id="countryCacheState" class="muted">国家列表未加载</p>
+          <div id="purchaseGroupList" class="group-list"></div>
+        </section>
+        <section>
+          <h3>购买设置高级 JSON</h3>
           <div class="field">
             <label for="settingsText">purchase_config.json</label>
             <textarea id="settingsText" spellcheck="false" style="min-height:300px"></textarea>
@@ -445,6 +479,9 @@
       "ADMIN_PASSWORD", "HERO_SMS_API_KEY", "TEMP_MAIL_ADMIN_PASSWORD",
       "CPA_MANAGEMENT_KEY", "SIGNUP_PASSWORD",
     ]);
+    let purchaseSettingsState = { serviceName: "OpenAI", serviceCode: "dr", purchaseGroups: [] };
+    let countryOptions = [];
+    let countryDatalistBuilt = false;
 
     function buildSettingsInputs() {
       const grid = $("appSettingsGrid");
@@ -551,7 +588,230 @@
 
     async function loadSettings() {
       const payload = await requestJSON("GET", "/api/purchase-settings");
-      $("settingsText").value = JSON.stringify(payload.purchaseSettings || payload, null, 2);
+      purchaseSettingsState = payload.purchaseSettings || payload;
+      $("settingsText").value = JSON.stringify(purchaseSettingsState, null, 2);
+      await ensureCountriesLoaded(false);
+      renderPurchaseGroups();
+    }
+
+    function normalizePurchaseGroupForUi(group = {}) {
+      const fixed = String(group.fixedPrice ?? "").toLowerCase() === "true" || group.fixedPrice === true;
+      return {
+        label: group.label || "",
+        enabled: group.enabled !== false,
+        countryName: group.countryName || "",
+        countryCode: group.countryCode || "",
+        operator: group.operator || "any",
+        priceMode: fixed ? "exact" : "max",
+        price: fixed ? (group.exactPrice || "") : (group.maxPrice || ""),
+      };
+    }
+
+    function buildCountryLabel(country) {
+      const name = country.localName || country.name || country.code;
+      const english = country.name && country.name !== name ? ` / ${country.name}` : "";
+      return `${name}${english} (${country.code})`;
+    }
+
+    function ensureCountryDatalist() {
+      if (countryDatalistBuilt) return;
+      let datalist = $("countryOptions");
+      if (!datalist) {
+        datalist = document.createElement("datalist");
+        datalist.id = "countryOptions";
+        document.body.appendChild(datalist);
+      }
+      datalist.innerHTML = countryOptions.map((country) => `<option value="${buildCountryLabel(country).replaceAll('"', '&quot;')}"></option>`).join("");
+      countryDatalistBuilt = true;
+    }
+
+    async function ensureCountriesLoaded(refresh) {
+      if (!refresh && countryOptions.length) return;
+      const payload = refresh
+        ? await requestJSON("POST", "/api/purchase-catalog/countries/refresh", {})
+        : await requestJSON("GET", "/api/purchase-catalog/countries?limit=200");
+      countryOptions = payload.items || [];
+      countryDatalistBuilt = false;
+      ensureCountryDatalist();
+      $("countryCacheState").textContent = `国家缓存: ${payload.total || countryOptions.length} 个，更新时间 ${payload.cachedAt || "--"}`;
+    }
+
+    function findCountryByInput(value) {
+      const text = String(value || "").trim();
+      const codeMatch = text.match(/\(([^()]+)\)\s*$/);
+      const code = codeMatch ? codeMatch[1] : text;
+      const normalized = text.toLowerCase();
+      return countryOptions.find((country) => String(country.code) === code)
+        || countryOptions.find((country) => buildCountryLabel(country).toLowerCase() === normalized)
+        || countryOptions.find((country) => `${country.localName || ""} ${country.name || ""} ${country.code || ""}`.toLowerCase().includes(normalized));
+    }
+
+    function getPurchaseGroupsFromDom() {
+      const groups = [];
+      for (const card of document.querySelectorAll(".purchase-group")) {
+        const priceMode = card.querySelector("[data-field='priceMode']").value;
+        const price = card.querySelector("[data-field='price']").value.trim();
+        const group = {
+          label: card.querySelector("[data-field='label']").value.trim(),
+          enabled: card.querySelector("[data-field='enabled']").checked,
+          countryName: card.querySelector("[data-field='countryName']").value.trim(),
+          countryCode: card.querySelector("[data-field='countryCode']").value.trim(),
+          operator: card.querySelector("[data-field='operator']").value.trim() || "any",
+          fixedPrice: priceMode === "exact",
+          exactPrice: priceMode === "exact" ? price : "",
+          maxPrice: priceMode === "max" ? price : "",
+        };
+        groups.push(group);
+      }
+      return groups;
+    }
+
+    function syncPurchaseJsonFromDom() {
+      purchaseSettingsState = {
+        serviceName: purchaseSettingsState.serviceName || "OpenAI",
+        serviceCode: purchaseSettingsState.serviceCode || "dr",
+        purchaseGroups: getPurchaseGroupsFromDom(),
+      };
+      $("settingsText").value = JSON.stringify(purchaseSettingsState, null, 2);
+    }
+
+    async function loadOperatorsForCard(card, refresh = false) {
+      const countryCode = card.querySelector("[data-field='countryCode']").value.trim();
+      const operatorSelect = card.querySelector("[data-field='operator']");
+      const current = operatorSelect.value || "any";
+      operatorSelect.innerHTML = `<option value="any">任意运营商</option>`;
+      if (!countryCode) return;
+      const serviceCode = encodeURIComponent(purchaseSettingsState.serviceCode || "dr");
+      const url = `/api/purchase-catalog/operators?serviceCode=${serviceCode}&countryCode=${encodeURIComponent(countryCode)}${refresh ? "&refresh=1" : ""}`;
+      const payload = await requestJSON("GET", url);
+      for (const item of payload.items || []) {
+        const value = String(item || "").trim();
+        if (!value || value === "any") continue;
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = value;
+        operatorSelect.appendChild(option);
+      }
+      operatorSelect.value = [...operatorSelect.options].some((option) => option.value === current) ? current : "any";
+    }
+
+    function renderPurchaseGroups() {
+      const list = $("purchaseGroupList");
+      const groups = (purchaseSettingsState.purchaseGroups || []).map(normalizePurchaseGroupForUi);
+      list.innerHTML = "";
+      groups.forEach((group, index) => {
+        const country = countryOptions.find((item) => String(item.code) === String(group.countryCode));
+        const card = document.createElement("div");
+        card.className = "purchase-group";
+        card.innerHTML = `
+          <div class="group-head">
+            <div class="group-title">设置组 ${index + 1}</div>
+            <div class="row">
+              <label class="inline-check"><input type="checkbox" data-field="enabled" ${group.enabled ? "checked" : ""}>启用</label>
+              <button data-action="up">上移</button>
+              <button data-action="down">下移</button>
+              <button data-action="delete" class="danger">删除</button>
+            </div>
+          </div>
+          <div class="settings-grid">
+            <div class="field">
+              <label>设置组名称</label>
+              <input data-field="label" value="${String(group.label).replaceAll('"', '&quot;')}">
+            </div>
+            <div class="field">
+              <label>国家/地区，输入中文名可匹配编号</label>
+              <input data-field="countrySearch" list="countryOptions" value="${country ? buildCountryLabel(country).replaceAll('"', '&quot;') : String(group.countryName || group.countryCode).replaceAll('"', '&quot;')}">
+            </div>
+            <div class="field">
+              <label>国家/地区编号</label>
+              <input data-field="countryCode" value="${String(group.countryCode).replaceAll('"', '&quot;')}">
+            </div>
+            <div class="field">
+              <label>国家/地区名称</label>
+              <input data-field="countryName" value="${String(group.countryName).replaceAll('"', '&quot;')}">
+            </div>
+            <div class="field">
+              <label>运营商</label>
+              <select data-field="operator"><option value="${String(group.operator).replaceAll('"', '&quot;')}">${group.operator || "any"}</option></select>
+            </div>
+            <div class="field">
+              <label>价格模式</label>
+              <select data-field="priceMode">
+                <option value="max" ${group.priceMode === "max" ? "selected" : ""}>最高价模式</option>
+                <option value="exact" ${group.priceMode === "exact" ? "selected" : ""}>精确价格模式</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>价格</label>
+              <input data-field="price" inputmode="decimal" value="${String(group.price).replaceAll('"', '&quot;')}">
+            </div>
+            <div class="field">
+              <label>运营商列表</label>
+              <button data-action="refreshOperators">刷新运营商</button>
+            </div>
+          </div>
+        `;
+        list.appendChild(card);
+        card.querySelector("[data-action='up']").disabled = index === 0;
+        card.querySelector("[data-action='down']").disabled = index === groups.length - 1;
+        card.querySelector("[data-action='up']").onclick = () => {
+          syncPurchaseJsonFromDom();
+          const next = purchaseSettingsState.purchaseGroups;
+          [next[index - 1], next[index]] = [next[index], next[index - 1]];
+          renderPurchaseGroups();
+          syncPurchaseJsonFromDom();
+        };
+        card.querySelector("[data-action='down']").onclick = () => {
+          syncPurchaseJsonFromDom();
+          const next = purchaseSettingsState.purchaseGroups;
+          [next[index + 1], next[index]] = [next[index], next[index + 1]];
+          renderPurchaseGroups();
+          syncPurchaseJsonFromDom();
+        };
+        card.querySelector("[data-action='delete']").onclick = () => {
+          syncPurchaseJsonFromDom();
+          purchaseSettingsState.purchaseGroups.splice(index, 1);
+          renderPurchaseGroups();
+          syncPurchaseJsonFromDom();
+        };
+        card.querySelector("[data-action='refreshOperators']").onclick = () => run(() => loadOperatorsForCard(card, true));
+        card.querySelector("[data-field='countrySearch']").addEventListener("change", async () => {
+          const selected = findCountryByInput(card.querySelector("[data-field='countrySearch']").value);
+          if (selected) {
+            card.querySelector("[data-field='countryCode']").value = selected.code || "";
+            card.querySelector("[data-field='countryName']").value = selected.localName || selected.name || "";
+            await loadOperatorsForCard(card, false);
+          }
+          syncPurchaseJsonFromDom();
+        });
+        for (const input of card.querySelectorAll("input, select")) {
+          input.addEventListener("input", syncPurchaseJsonFromDom);
+          input.addEventListener("change", syncPurchaseJsonFromDom);
+        }
+        loadOperatorsForCard(card, false).catch((error) => log(`ERROR: 加载运营商失败: ${error.message || error}`));
+      });
+      syncPurchaseJsonFromDom();
+    }
+
+    function addPurchaseGroup() {
+      syncPurchaseJsonFromDom();
+      purchaseSettingsState.purchaseGroups.push({
+        label: "",
+        enabled: true,
+        countryName: "",
+        countryCode: "",
+        operator: "any",
+        fixedPrice: false,
+        exactPrice: "",
+        maxPrice: "",
+      });
+      renderPurchaseGroups();
+    }
+
+    async function savePurchaseGroups() {
+      syncPurchaseJsonFromDom();
+      await saveSettings();
+      await loadSettings();
     }
 
     async function loadEmailQueue() {
@@ -590,7 +850,9 @@
     async function saveSettings() {
       const payload = JSON.parse($("settingsText").value);
       const result = await requestJSON("POST", "/api/purchase-settings", payload);
-      $("settingsText").value = JSON.stringify(result.purchaseSettings || result, null, 2);
+      purchaseSettingsState = result.purchaseSettings || result;
+      $("settingsText").value = JSON.stringify(purchaseSettingsState, null, 2);
+      renderPurchaseGroups();
       log("购买设置已保存");
     }
 
@@ -758,6 +1020,10 @@
     $("finishBtn").onclick = () => run(() => phoneAction("finish"));
     $("loadSettingsBtn").onclick = () => run(loadSettings);
     $("saveSettingsBtn").onclick = () => run(saveSettings);
+    $("addPurchaseGroupBtn").onclick = () => run(addPurchaseGroup);
+    $("loadPurchaseGroupsBtn").onclick = () => run(loadSettings);
+    $("savePurchaseGroupsBtn").onclick = () => run(savePurchaseGroups);
+    $("refreshCountriesBtn").onclick = () => run(async () => { await ensureCountriesLoaded(true); renderPurchaseGroups(); });
     $("generateEmailQueueBtn").onclick = () => run(generateEmailQueue);
     $("saveEmailQueueBtn").onclick = () => run(saveEmailQueue);
     $("loadEmailQueueBtn").onclick = () => run(loadEmailQueue);

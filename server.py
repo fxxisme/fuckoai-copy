@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parent
 PURCHASE_CONFIG_PATH = ROOT / "purchase_config.json"
 CONTROL_PANEL_PATH = ROOT / "control_panel.html"
 EMAIL_QUEUE_PATH = ROOT / "data/email_queue.json"
+CATALOG_CACHE_PATH = ROOT / "data/catalog_cache.json"
 SIGNUP_URL = "https://chatgpt.com/auth/login?intent=signup"
 DEFAULT_SERVICE_NAME = "OpenAI"
 DEFAULT_SERVICE_CODE = "dr"
@@ -541,8 +542,8 @@ class HeroSmsClient:
         services = self._normalize_services(self.request("getServicesList"))
         return self._set_cached("services", services)
 
-    def get_countries(self) -> list[dict[str, Any]]:
-        cached = self._get_cached("countries")
+    def get_countries(self, force: bool = False) -> list[dict[str, Any]]:
+        cached = None if force else self._get_cached("countries")
         if cached is not None:
             return cached
         countries = self._normalize_countries(self.request("getCountries"))
@@ -575,14 +576,32 @@ class HeroSmsClient:
         result = self._extract_price_info(fallback, country_code, service_code) or {"price": None, "count": None, "raw": fallback}
         return self._set_cached(cache_key, result)
 
-    def get_operators(self, service_code: str, country_code: str) -> list[str]:
+    def get_operators(self, service_code: str, country_code: str, force: bool = False) -> list[str]:
+        cache_key = f"operators:{service_code}:{country_code}"
+        cached = None if force else self._get_cached(cache_key)
+        if cached is not None:
+            return cached
         try:
-            payload = self.request("getPricesVerification", service=service_code, country=country_code)
+            payload = self.request("getOperators", country=country_code)
         except HeroSmsError:
-            return ["any"]
-        source = payload.get("operators") if isinstance(payload, dict) else None
+            try:
+                payload = self.request("getPricesVerification", service=service_code, country=country_code)
+            except HeroSmsError:
+                return self._set_cached(cache_key, ["any"])
+        if isinstance(payload, dict):
+            source = (
+                payload.get("operators")
+                or payload.get("countryOperators")
+                or payload.get("data")
+                or payload.get("items")
+                or payload
+            )
+        else:
+            source = payload
+        if isinstance(source, dict):
+            source = source.get(country_code) or source.get(str(int(country_code)) if str(country_code).isdigit() else country_code) or source
         if not source:
-            return ["any"]
+            return self._set_cached(cache_key, ["any"])
         values = []
         if isinstance(source, dict):
             iterator = source.values()
@@ -596,7 +615,7 @@ class HeroSmsClient:
             if value:
                 values.append(str(value))
         result = sorted(set(values))
-        return result or ["any"]
+        return self._set_cached(cache_key, result or ["any"])
 
     def buy_activation(self, *, service_code: str, country_code: str, operator: str, max_price: str | None) -> dict[str, Any]:
         payload = self.request(
@@ -676,7 +695,16 @@ class HeroSmsClient:
         for item in items:
             code = str(item.get("code") or item.get("id") or item.get("value") or "")
             name = str(item.get("eng") or item.get("name") or item.get("text") or "").strip()
-            local_name = str(item.get("rus") or item.get("localName") or item.get("name") or "").strip()
+            local_name = str(
+                item.get("chn")
+                or item.get("cn")
+                or item.get("chinese")
+                or item.get("name_cn")
+                or item.get("rus")
+                or item.get("localName")
+                or item.get("name")
+                or ""
+            ).strip()
             search_terms = []
             seen_terms: set[str] = set()
             for value in [code, *collect_string_values(item)]:
@@ -2309,6 +2337,71 @@ def search_countries_by_name(name: str, limit: int = 8) -> list[dict[str, Any]]:
     return [item for _, _, item in ranked[:limit]]
 
 
+def load_catalog_cache() -> dict[str, Any]:
+    return load_json_file(CATALOG_CACHE_PATH)
+
+
+def save_catalog_cache(cache: dict[str, Any]) -> dict[str, Any]:
+    save_json_file(CATALOG_CACHE_PATH, cache)
+    return cache
+
+
+def get_cached_countries(*, refresh: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    cache = load_catalog_cache()
+    countries = cache.get("countries")
+    if refresh or not isinstance(countries, list):
+        countries = CLIENT.get_countries(force=True)
+        cache["countries"] = countries
+        cache["countriesCachedAt"] = now_iso()
+        save_catalog_cache(cache)
+    return countries, cache
+
+
+def search_country_items(items: list[dict[str, Any]], query_text: str, limit: int = 20) -> list[dict[str, Any]]:
+    query = normalize_text(query_text)
+    ranked: list[tuple[int, str, dict[str, Any]]] = []
+    for item in items:
+        fields = [str(item.get("name") or ""), str(item.get("localName") or ""), str(item.get("code") or "")]
+        if isinstance(item.get("searchTerms"), list):
+            fields.extend(str(term) for term in item.get("searchTerms") if term)
+        if not query:
+            label = str(item.get("name") or item.get("localName") or item.get("code") or "")
+            ranked.append((3, label.lower(), item))
+            continue
+        score: int | None = None
+        for field in fields:
+            normalized = normalize_text(field)
+            if not normalized:
+                continue
+            if normalized == query:
+                score = 0 if score is None else min(score, 0)
+            elif normalized.startswith(query) or query.startswith(normalized):
+                score = 1 if score is None else min(score, 1)
+            elif query in normalized or normalized in query:
+                score = 2 if score is None else min(score, 2)
+        if score is not None:
+            label = str(item.get("name") or item.get("localName") or item.get("code") or "")
+            ranked.append((score, label.lower(), item))
+    ranked.sort(key=lambda entry: (entry[0], entry[1]))
+    return [item for _, _, item in ranked[:limit]]
+
+
+def get_cached_operators(service_code: str, country_code: str, *, refresh: bool = False) -> tuple[list[str], dict[str, Any]]:
+    cache = load_catalog_cache()
+    operators_cache = cache.get("operators")
+    if not isinstance(operators_cache, dict):
+        operators_cache = {}
+        cache["operators"] = operators_cache
+    cache_key = f"{service_code}:{country_code}"
+    cached_entry = operators_cache.get(cache_key)
+    operators = cached_entry.get("items") if isinstance(cached_entry, dict) else None
+    if refresh or not isinstance(operators, list):
+        operators = CLIENT.get_operators(service_code, country_code, force=True)
+        operators_cache[cache_key] = {"items": operators, "cachedAt": now_iso()}
+        save_catalog_cache(cache)
+    return operators, cache
+
+
 def normalize_record(record: dict[str, Any]) -> dict[str, Any]:
     item = dict(record)
     item["isClosed"] = item.get("status") in {"finished", "canceled"}
@@ -2836,6 +2929,56 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"purchaseSettings": settings, "purchaseConfig": get_purchase_config()})
             return
 
+        if method == "GET" and path == "/api/purchase-catalog/countries":
+            refresh = parse_bool_flag(query.get("refresh"), default=False)
+            limit = parse_positive_int(query.get("limit"), default=20)
+            countries, cache = get_cached_countries(refresh=refresh)
+            matches = search_country_items(countries, query.get("query", ""), limit=min(max(limit, 1), 200))
+            self.send_json(
+                200,
+                {
+                    "items": matches,
+                    "total": len(countries),
+                    "cachedAt": cache.get("countriesCachedAt", ""),
+                    "refreshed": refresh,
+                },
+            )
+            return
+
+        if method == "POST" and path == "/api/purchase-catalog/countries/refresh":
+            countries, cache = get_cached_countries(refresh=True)
+            self.send_json(
+                200,
+                {
+                    "items": search_country_items(countries, "", limit=50),
+                    "total": len(countries),
+                    "cachedAt": cache.get("countriesCachedAt", ""),
+                    "refreshed": True,
+                },
+            )
+            return
+
+        if method == "GET" and path == "/api/purchase-catalog/operators":
+            service_code = str(query.get("serviceCode") or get_purchase_settings().get("serviceCode") or DEFAULT_SERVICE_CODE).strip()
+            country_code = str(query.get("countryCode") or "").strip()
+            if not country_code:
+                self.send_json(400, {"error": "缺少 countryCode"})
+                return
+            refresh = parse_bool_flag(query.get("refresh"), default=False)
+            operators, cache = get_cached_operators(service_code, country_code, refresh=refresh)
+            operator_entry = (cache.get("operators") or {}).get(f"{service_code}:{country_code}") or {}
+            self.send_json(
+                200,
+                {
+                    "items": operators,
+                    "serviceCode": service_code,
+                    "countryCode": country_code,
+                    "cachedAt": operator_entry.get("cachedAt", ""),
+                    "refreshed": refresh,
+                },
+            )
+            return
+
         if method == "GET" and path == "/api/temp-mail/settings":
             self.send_json(200, {"settings": TEMP_MAIL.get_settings()})
             return
@@ -3267,6 +3410,9 @@ class AppHandler(BaseHTTPRequestHandler):
                         "appSettings": "GET /api/app-settings",
                         "saveAppSettings": "POST /api/app-settings",
                         "balance": "GET /api/balance",
+                        "purchaseCountries": "GET /api/purchase-catalog/countries?query=中国",
+                        "refreshPurchaseCountries": "POST /api/purchase-catalog/countries/refresh",
+                        "purchaseOperators": "GET /api/purchase-catalog/operators?countryCode=33&serviceCode=dr",
                         "purchase": "POST /api/purchase",
                         "currentPhone": "GET /api/current-phone",
                         "listActive": "GET /api/activations",
