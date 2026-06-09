@@ -5,6 +5,7 @@ services:
     build:
       context: .
     container_name: fuckoai
+    init: true
     restart: unless-stopped
     network_mode: host
     environment:
