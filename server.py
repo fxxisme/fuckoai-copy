@@ -1559,6 +1559,21 @@ class UcSignupManager:
                 "age": CONFIG.signup_age,
             }.get(key, "")
             value = str(options.get(key) or fallback).strip()
+
+            # 每次注册随机生成姓名和年龄
+            if key == "name" and not options.get(key):
+                # 50% 概率使用常见单名，50% 概率使用 4-5 位随机字母
+                if random.random() < 0.5:
+                    names = ["simon", "jim", "alex", "mike", "tom", "jack", "ryan", "chris", "dan", "sam",
+                            "emma", "lisa", "anna", "kate", "lucy", "amy", "sara", "nina", "ella", "mia",
+                            "ben", "leo", "max", "luke", "eric", "mark", "paul", "alan", "carl", "dave"]
+                    value = random.choice(names)
+                else:
+                    length = random.randint(4, 5)
+                    value = ''.join(random.choice(string.ascii_lowercase) for _ in range(length))
+            elif key == "age" and not options.get(key):
+                value = str(random.randint(20, 60))
+
             if value:
                 env[env_key] = value
 
