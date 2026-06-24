@@ -669,14 +669,26 @@
 
     function normalizePurchaseGroupForUi(group = {}) {
       const fixed = String(group.fixedPrice ?? "").toLowerCase() === "true" || group.fixedPrice === true;
+      const minPrice = String(group.minPrice ?? "").toLowerCase() === "true" || group.minPrice === true;
+      let priceMode = "max";
+      let price = group.maxPrice || "";
+
+      if (fixed) {
+        priceMode = "exact";
+        price = group.exactPrice || "";
+      } else if (minPrice) {
+        priceMode = "min";
+        price = "";  // 最低价模式不需要填价格
+      }
+
       return {
         label: group.label || "",
         enabled: group.enabled !== false,
         countryName: group.countryName || "",
         countryCode: group.countryCode || "",
         operator: group.operator || "any",
-        priceMode: fixed ? "exact" : "max",
-        price: fixed ? (group.exactPrice || "") : (group.maxPrice || ""),
+        priceMode: priceMode,
+        price: price,
       };
     }
 
@@ -836,6 +848,7 @@
           countryCode: card.querySelector("[data-field='countryCode']").value.trim(),
           operator: card.querySelector("[data-field='operator']").value.trim() || "any",
           fixedPrice: priceMode === "exact",
+          minPrice: priceMode === "min",
           exactPrice: priceMode === "exact" ? price : "",
           maxPrice: priceMode === "max" ? price : "",
         };
@@ -919,6 +932,7 @@
               <label>价格模式</label>
               <select data-field="priceMode">
                 <option value="max" ${group.priceMode === "max" ? "selected" : ""}>最高价模式</option>
+                <option value="min" ${group.priceMode === "min" ? "selected" : ""}>最低价模式</option>
                 <option value="exact" ${group.priceMode === "exact" ? "selected" : ""}>精确价格模式</option>
               </select>
             </div>
