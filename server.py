@@ -774,23 +774,6 @@ class HeroSmsClient:
         )
         return self._parse_purchase_payload(payload, service_code, country_code, operator)
 
-    def buy_activation_min_price(
-        self,
-        *,
-        service_code: str,
-        country_code: str,
-        operator: str,
-    ) -> dict[str, Any]:
-        """最低价模式：不传 maxPrice，让 API 返回最便宜的号码"""
-        payload = self.request(
-            "getNumberV2",
-            service=service_code,
-            country=country_code,
-            operator=operator or "any",
-            maxPrice="",  # 不限制最高价，获取最便宜的
-        )
-        return self._parse_purchase_payload(payload, service_code, country_code, operator)
-
     def buy_activation_fixed_price(
         self,
         *,
@@ -1897,7 +1880,6 @@ def get_filters(source: dict[str, Any] | None = None, defaults: dict[str, Any] |
         "maxPrice": str(base.get("maxPrice") or ""),
         "exactPrice": str(base.get("exactPrice") or ""),
         "fixedPrice": normalize_fixed_price_value(base.get("fixedPrice")),
-        "minPrice": normalize_fixed_price_value(base.get("minPrice")),
     }
 
 
@@ -2231,15 +2213,7 @@ def build_purchase_attempts(source: dict[str, Any] | None = None) -> list[dict[s
 
 def execute_purchase(filters: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any]]:
     resolved = resolve_selections(filters)
-    if filters["minPrice"] == "true":
-        # 最低价模式
-        purchase = CLIENT.buy_activation_min_price(
-            service_code=resolved["service"]["code"],
-            country_code=resolved["country"]["code"],
-            operator=filters["operator"],
-        )
-    elif filters["fixedPrice"] == "true" and filters["exactPrice"]:
-        # 精确价格模式
+    if filters["fixedPrice"] == "true" and filters["exactPrice"]:
         purchase = CLIENT.buy_activation_fixed_price(
             service_code=resolved["service"]["code"],
             country_code=resolved["country"]["code"],
@@ -2247,7 +2221,6 @@ def execute_purchase(filters: dict[str, str]) -> tuple[dict[str, Any], dict[str,
             exact_price=filters["exactPrice"],
         )
     else:
-        # 最高价模式
         purchase = CLIENT.buy_activation(
             service_code=resolved["service"]["code"],
             country_code=resolved["country"]["code"],
