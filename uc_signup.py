@@ -322,6 +322,12 @@ class SignupBot:
             log(f"  邮箱创建确认失败，继续使用传入邮箱: {e}", "warn")
         return self.requested_email
 
+    def close_browser(self):
+        if self.d:
+            try: self.d.quit()
+            except: pass
+            self.d = None
+
     def fill_birth_year(self, age_str: str):
         """填年龄或出生年份：优先试 input[name=age]，失败则用当前年份反推出生年份"""
         try:
