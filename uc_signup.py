@@ -576,9 +576,9 @@ class SignupBot:
             # ═══ 准备 ═══
             try:
                 balance_before = float(api("GET", "/api/balance?force=1").get("balance", 0))
-            except Exception:
+            except Exception as e:
                 balance_before = None
-                log("  开始余额查询失败，跳过", "warn")
+                log(f"  开始余额查询失败: {e}", "warn")
             if balance_before is not None:
                 log(f"  💰 开始余额: {balance_before}")
             last_phone_error = ""
