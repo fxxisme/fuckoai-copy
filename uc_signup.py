@@ -322,11 +322,51 @@ class SignupBot:
             log(f"  邮箱创建确认失败，继续使用传入邮箱: {e}", "warn")
         return self.requested_email
 
-    def close_browser(self):
-        if self.d:
-            try: self.d.quit()
-            except: pass
-            self.d = None
+    def fill_birth_year(self, age_str: str):
+        """填年龄或出生年份：优先试 input[name=age]，失败则用当前年份反推出生年份"""
+        try:
+            self.fill("input[name=age]", str(age_str), retries=1)
+            return
+        except StepError:
+            pass
+
+        # 反推出生年份
+        try:
+            birth_year = str(datetime.now().year - int(age_str))
+        except (ValueError, TypeError):
+            raise StepError(f"无效的年龄值: {age_str}")
+
+        log(f"  input[name=age] 不可用，尝试出生年份 {birth_year}")
+
+        selectors = [
+            "input[name=birthYear]",
+            "input[name=birth_year]",
+            "input[placeholder*=year i]",
+            "input[placeholder*=出生]",
+            "input[aria-label*=year i]",
+            "input[id*=birth i]",
+            "input[id*=year i]",
+            "input[name=age]",
+        ]
+        for sel in selectors:
+            els = self.d.find_elements(By.CSS_SELECTOR, sel)
+            if els:
+                try:
+                    self.fill(sel, birth_year)
+                    return
+                except StepError:
+                    continue
+
+        # 最后：打印当前页所有可见 input 的标识属性，帮助后续诊断
+        inputs_info = []
+        for el in self.d.find_elements(By.CSS_SELECTOR, "input:not([type=hidden])"):
+            try:
+                tag = el.get_attribute("name") or el.get_attribute("id") or el.get_attribute("placeholder") or el.get_attribute("aria-label") or "?"
+                inputs_info.append(tag)
+            except Exception:
+                pass
+        log(f"  当前页面可见 input: {inputs_info}", "warn")
+        raise StepError("找不到年龄/出生年份输入框")
 
     def cancel_phone(self, phone, reason=""):
         if not phone:
@@ -404,7 +444,7 @@ class SignupBot:
 
         self._step("姓名年龄", lambda: (
             self.fill("input[name=name]", NAME),
-            self.fill("input[name=age]", AGE),
+            self.fill_birth_year(AGE),
             self.click("Finish creating account")
         ))
         time.sleep(8)
