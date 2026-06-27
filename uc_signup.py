@@ -19,6 +19,8 @@ from selenium.common.exceptions import TimeoutException, StaleElementReferenceEx
 API    = os.getenv("UC_SIGNUP_API_BASE", os.getenv("API_BASE", "http://127.0.0.1:3030"))
 PROXY  = os.getenv("UC_SIGNUP_PROXY", os.getenv("BROWSER_PROXY", os.getenv("PROXY", ""))).strip()
 ROOT   = Path(__file__).resolve().parent
+# 出错诊断转储目录（可被 UC_SIGNUP_DIAG_DIR 覆盖，便于 docker 挂载持久卷）
+DIAG_DIR = Path(os.getenv("UC_SIGNUP_DIAG_DIR", str(ROOT / "diagnostics")))
 MAX_RETRIES    = 3   # 每步最大重试次数
 MAX_ERROR_REFRESH = 5  # 错误页刷新次数
 PHONE_RETRY_LIMIT = int(os.getenv("UC_SIGNUP_PHONE_RETRIES", "0"))
@@ -328,6 +330,76 @@ class SignupBot:
             except: pass
             self.d = None
 
+    def dump_diagnostics(self, tag=""):
+        """把当前页面快照存到 DIAG_DIR，便于事后排查找不到控件等问题。
+        保存：URL/title、可见 input/select/textarea 清单、截图、整页 HTML。
+        失败静默，绝不能影响主流程。返回写入的文件路径前缀或 None。"""
+        if not self.d:
+            return None
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_tag = re.sub(r"[^A-Za-z0-9_-]+", "_", tag or "diag").strip("_") or "diag"
+        try:
+            DIAG_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            log(f"  诊断目录不可写 {DIAG_DIR}: {e}", "warn")
+            return None
+        prefix = DIAG_DIR / f"{stamp}_{safe_tag}"
+        summary = []
+        try:
+            url = self.d.current_url or ""
+            title = self.d.title or ""
+            summary.append(f"URL: {url}")
+            summary.append(f"Title: {title}")
+        except Exception as e:
+            summary.append(f"URL/Title 读取失败: {e}")
+
+        def describe(el):
+            """收集一个表单控件的可识别属性"""
+            attrs = {}
+            for a in ("name", "id", "type", "placeholder", "aria-label", "value"):
+                try: attrs[a] = el.get_attribute(a)
+                except Exception: attrs[a] = None
+            return attrs
+
+        # 扫描可见表单控件：input / select / textarea（含部分 type 过滤）
+        for kind, sel in (("input", "input:not([type=hidden])"),
+                          ("select", "select"),
+                          ("textarea", "textarea")):
+            try: elements = self.d.find_elements(By.CSS_SELECTOR, sel)
+            except Exception: elements = []
+            rows = []
+            for el in elements:
+                try:
+                    if not el.is_displayed():
+                        continue
+                except Exception:
+                    pass
+                rows.append(describe(el))
+            summary.append(f"{kind} (visible={len(rows)}): {json.dumps(rows, ensure_ascii=False)}")
+        # 检测 iframe，字段可能藏在框架内
+        try:
+            iframes = self.d.find_elements(By.TAG_NAME, "iframe")
+            summary.append(f"iframe count: {len(iframes)}")
+        except Exception:
+            pass
+
+        try:
+            (prefix.with_suffix(".txt")).write_text(
+                "\n".join(summary), encoding="utf-8")
+        except Exception as e:
+            log(f"  诊断摘要写入失败: {e}", "warn")
+        try:
+            self.d.save_screenshot(str(prefix.with_suffix(".png")))
+        except Exception:
+            pass
+        try:
+            html = self.d.page_source or ""
+            (prefix.with_suffix(".html")).write_text(html, encoding="utf-8")
+        except Exception as e:
+            log(f"  页面源码写入失败: {e}", "warn")
+        log(f"  诊断已保存: {prefix}.*", "warn")
+        return str(prefix)
+
     def fill_birth_year(self, age_str: str):
         """填年龄或出生年份：优先试 input[name=age]，失败则用当前年份反推出生年份"""
         try:
@@ -372,6 +444,8 @@ class SignupBot:
             except Exception:
                 pass
         log(f"  当前页面可见 input: {inputs_info}", "warn")
+        # 兜底：找不到年龄框时把页面快照存盘，便于事后排查（分步表单/select/iframe 等）
+        self.dump_diagnostics("fill_birth_year_missing_age")
         raise StepError("找不到年龄/出生年份输入框")
 
     def cancel_phone(self, phone, reason=""):
