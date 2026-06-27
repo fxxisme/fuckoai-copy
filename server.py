@@ -2688,8 +2688,9 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if method == "GET" and path == "/api/balance":
+            force = str(query.get("force", "")).lower() in ("1", "true", "yes")
             try:
-                balance = CLIENT.get_balance_cached()
+                balance = CLIENT.get_balance_cached(force=force)
             except HeroSmsError:
                 balance = None
             self.send_json(200, {"balance": balance})

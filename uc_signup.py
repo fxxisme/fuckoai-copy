@@ -571,8 +571,16 @@ class SignupBot:
 
         phone = full_phone = ""
         completed_success = False
+        balance_before = None
         try:
             # ═══ 准备 ═══
+            try:
+                balance_before = api("GET", "/api/balance?force=1").get("balance")
+            except Exception:
+                balance_before = None
+                log("  开始余额查询失败，跳过", "warn")
+            if balance_before is not None:
+                log(f"  💰 开始余额: {balance_before}")
             last_phone_error = ""
             phone_attempt = 0
             while True:
@@ -704,6 +712,17 @@ class SignupBot:
             log("=" * 55)
             log(f"✅ 全部完成! {self.email}")
             completed_success = True
+            # 结束余额
+            try:
+                balance_after = api("GET", "/api/balance?force=1").get("balance")
+            except Exception:
+                balance_after = None
+            if balance_before is not None and balance_after is not None:
+                diff = balance_after - balance_before
+                sign = "+" if diff >= 0 else ""
+                log(f"💰 结束余额: {balance_after}  (本次 {sign}{diff})")
+            elif balance_after is not None:
+                log(f"💰 结束余额: {balance_after}")
             return True
 
         except FatalError as e:
