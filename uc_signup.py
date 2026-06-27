@@ -575,7 +575,7 @@ class SignupBot:
         try:
             # ═══ 准备 ═══
             try:
-                balance_before = api("GET", "/api/balance?force=1").get("balance")
+                balance_before = float(api("GET", "/api/balance?force=1").get("balance", 0))
             except Exception:
                 balance_before = None
                 log("  开始余额查询失败，跳过", "warn")
@@ -714,7 +714,7 @@ class SignupBot:
             completed_success = True
             # 结束余额
             try:
-                balance_after = api("GET", "/api/balance?force=1").get("balance")
+                balance_after = float(api("GET", "/api/balance?force=1").get("balance", 0))
             except Exception:
                 balance_after = None
             if balance_before is not None and balance_after is not None:
