@@ -135,6 +135,8 @@ class SignupBot:
     def __init__(self, email=""):
         self.d = None
         self.requested_email = str(email or "").strip()
+        # 延迟创建：进入 add-email 分支才真正建邮箱，避免注册/换号阶段白白建一次
+        self.email = ""
 
     def launch(self):
         os.environ["DISPLAY"] = DISPLAY
@@ -324,6 +326,14 @@ class SignupBot:
             log(f"  邮箱创建确认失败，继续使用传入邮箱: {e}", "warn")
         return self.requested_email
 
+    def ensure_email(self):
+        """幂等地获取邮箱：首次调用创建/确认，之后直接返回缓存值。
+        调用时机推迟到真正需要填邮箱（add-email 分支），省掉注册/换号阶段的无效创建。"""
+        if self.email:
+            return self.email
+        self.email = self.prepare_email()
+        return self.email
+
     def close_browser(self):
         if self.d:
             try: self.d.quit()
@@ -480,9 +490,9 @@ class SignupBot:
             cancel_phone=False,
         )
 
-    def register_with_phone(self, phone, email):
+    def register_with_phone(self, phone):
         full_phone = "+" + re.sub(r'\D', '', phone)
-        log(f"📱 {phone}  📧 {email}")
+        log(f"📱 {phone}")
 
         self.launch()
 
@@ -559,11 +569,10 @@ class SignupBot:
         log("ChatGPT 注册 → OAuth → CPA 回调")
         log("=" * 55)
 
-        phone = email = full_phone = ""
+        phone = full_phone = ""
         completed_success = False
         try:
             # ═══ 准备 ═══
-            email = self.prepare_email()
             last_phone_error = ""
             phone_attempt = 0
             while True:
@@ -578,7 +587,7 @@ class SignupBot:
                 phone = api("POST", "/api/purchase", {})["item"]["phoneNumber"]
                 log(f"  手机号尝试 {attempt_label}")
                 try:
-                    full_phone = self.register_with_phone(phone, email)
+                    full_phone = self.register_with_phone(phone)
                     break
                 except PhoneRetry as e:
                     last_phone_error = str(e)
@@ -591,7 +600,7 @@ class SignupBot:
                     phone = ""
                     full_phone = ""
                     self.close_browser()
-                    log(f"  继续使用同一邮箱换下一个手机号，从头开始注册: {email}", "warn")
+                    log("  从头开始注册，邮箱按需延迟创建", "warn")
                     continue
 
             # ═══ Part 2: OAuth（同一浏览器，保持登录态）═══
@@ -626,8 +635,10 @@ class SignupBot:
                 ))
                 log(f"  → {self.d.title}")
 
-            # 绑定邮箱
+            # 绑定邮箱：进入此分支才真正创建/确认邮箱（幂等，_step 重试不会重复建）
             if "add-email" in self.d.current_url.lower():
+                email = self.ensure_email()
+                log(f"  邮箱: {email}")
                 self._step("绑定邮箱", lambda: (
                     self.fill_any(["input[type=email]", "input[name=email]"], email),
                     self.click("Continue"), time.sleep(5)
@@ -691,7 +702,7 @@ class SignupBot:
             except: pass
 
             log("=" * 55)
-            log(f"✅ 全部完成! {email}")
+            log(f"✅ 全部完成! {self.email}")
             completed_success = True
             return True
 
