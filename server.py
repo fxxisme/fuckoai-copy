@@ -672,7 +672,13 @@ class HeroSmsClient:
         return payload
 
     def get_balance(self) -> Any:
-        return self.request("getBalance")
+        result = self.request("getBalance")
+        if isinstance(result, str) and result.startswith("ACCESS_BALANCE:"):
+            try:
+                return float(result.split(":", 1)[1])
+            except (ValueError, IndexError):
+                pass
+        return result
 
     def get_balance_cached(self, force: bool = False) -> Any:
         if not force:
