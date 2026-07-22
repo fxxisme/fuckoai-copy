@@ -23,8 +23,8 @@ RUN apt-get update \
         /usr/share/locale/*
 
 RUN pip install --no-cache-dir --no-compile \
-        selenium \
-        undetected-chromedriver
+        selenium undetected-chromedriver \
+        cryptography curl_cffi
 
 WORKDIR /app
 COPY . /app

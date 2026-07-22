@@ -71,6 +71,8 @@ APP_SETTING_FIELDS = (
     "ENABLE_CORS",
     "STORE_FILE",
     "PURCHASE_CONFIG_FILE",
+    "SUB2API_BASE_URL",
+    "SUB2API_ADMIN_API_KEY",
 )
 
 DEFAULT_APP_SETTINGS: dict[str, Any] = {
@@ -98,6 +100,8 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
     "ENABLE_CORS": "true",
     "STORE_FILE": "./data/activations.json",
     "PURCHASE_CONFIG_FILE": "./data/purchase_config.json",
+    "SUB2API_BASE_URL": "",
+    "SUB2API_ADMIN_API_KEY": "",
 }
 
 
@@ -227,6 +231,53 @@ class UcSignupState:
         }
 
 
+
+@dataclass
+class FreeBreakthroughState:
+    running: bool = False
+    stop_requested: bool = False
+    total: int = 0
+    completed: int = 0
+    success: int = 0
+    failed: int = 0
+    current_index: int = 0
+    current_email: str = ""
+    current_step: str = ""
+    phase: str = "idle"
+    started_at: str = ""
+    updated_at: str = ""
+    current_pid: int | None = None
+    results: list[dict[str, Any]] = None
+    errors: list[dict[str, str]] = None
+    log_lines: list[dict[str, str]] = None
+
+    def __post_init__(self) -> None:
+        if self.results is None:
+            self.results = []
+        if self.errors is None:
+            self.errors = []
+        if self.log_lines is None:
+            self.log_lines = []
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "running": self.running,
+            "stopRequested": self.stop_requested,
+            "total": self.total,
+            "completed": self.completed,
+            "success": self.success,
+            "failed": self.failed,
+            "currentIndex": self.current_index,
+            "currentEmail": self.current_email,
+            "currentStep": self.current_step,
+            "phase": self.phase,
+            "startedAt": self.started_at,
+            "updatedAt": self.updated_at,
+            "currentPid": self.current_pid,
+            "results": list(self.results),
+            "errors": list(self.errors),
+            "logLines": list(self.log_lines),
+        }
 @dataclass
 class Config:
     host: str = app_config_value("HOST", "0.0.0.0")
@@ -1690,6 +1741,293 @@ class UcSignupManager:
 UC_SIGNUP_MANAGER = UcSignupManager()
 
 
+FREE_BREAKTHROUGH_LOG_MAX_LINES = 2000
+
+class FreeBreakthroughManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._process: subprocess.Popen | None = None
+        self._state = FreeBreakthroughState()
+        self._log_buffer: list[dict[str, str]] = []
+
+    def get_state(self) -> dict[str, Any]:
+        with self._lock:
+            return self._state.to_dict()
+
+    def get_logs(self) -> list[dict[str, str]]:
+        with self._lock:
+            return list(self._log_buffer)
+
+    def append_log(self, message: str, level: str = "info") -> None:
+        entry = {
+            "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "message": str(message),
+            "level": level,
+        }
+        with self._lock:
+            self._log_buffer.append(entry)
+            while len(self._log_buffer) > FREE_BREAKTHROUGH_LOG_MAX_LINES:
+                self._log_buffer.pop(0)
+            self._state.log_lines = list(self._log_buffer)
+            self._state.updated_at = now_iso()
+
+    def _update_state(self, **kwargs: Any) -> None:
+        with self._lock:
+            for key, value in kwargs.items():
+                if hasattr(self._state, key):
+                    setattr(self._state, key, value)
+            self._state.updated_at = now_iso()
+
+    def _add_error(self, message: str) -> None:
+        with self._lock:
+            self._state.errors.append({"time": now_iso(), "message": str(message)})
+            if len(self._state.errors) > 50:
+                self._state.errors = self._state.errors[-50:]
+
+    def start(self, emails: list[str], **options: Any) -> dict[str, Any]:
+        if not (ROOT / "free_breakthrough.py").exists():
+            return {"error": "未找到 free_breakthrough.py", "fbState": self.get_state()}
+
+        with self._lock:
+            if self._state.running:
+                return {"error": "free突破 任务已在运行中", "fbState": self._state.to_dict()}
+            self._stop_event.clear()
+            self._process = None
+            self._log_buffer = []
+            self._state = FreeBreakthroughState(
+                running=True,
+                total=len(emails),
+                phase="running",
+                started_at=now_iso(),
+                updated_at=now_iso(),
+            )
+
+        self._thread = threading.Thread(target=self._run, args=(emails, options), daemon=True)
+        self._thread.start()
+        return {"fbState": self.get_state()}
+
+    def stop(self) -> dict[str, Any]:
+        process: subprocess.Popen | None = None
+        with self._lock:
+            if not self._state.running:
+                return {"fbState": self._state.to_dict(), "message": "没有运行中的 free突破 任务"}
+            self._state.stop_requested = True
+            self._state.phase = "stopping"
+            self._state.updated_at = now_iso()
+            process = self._process
+        self._stop_event.set()
+        self._terminate_process(process)
+        return {"fbState": self.get_state()}
+
+    def _run(self, emails: list[str], options: dict[str, Any]) -> None:
+        self.append_log(f"free突破 任务启动: {len(emails)} 个邮箱")
+        for index, email in enumerate(emails):
+            if self._stop_event.is_set():
+                self.append_log("收到停止信号，结束 free突破 任务", level="warn")
+                break
+
+            self._update_state(
+                current_index=index,
+                current_email=email,
+                current_step="starting",
+                current_pid=None,
+            )
+            self.append_log("")
+            self.append_log(f"===== 第 {index + 1}/{len(emails)} 个: {email} =====")
+            started_at = now_iso()
+            result, error, return_code = self._run_one(email, options)
+            finished_at = now_iso()
+
+            with self._lock:
+                self._state.completed += 1
+                if result == "success":
+                    self._state.success += 1
+                elif result == "fail":
+                    self._state.failed += 1
+                self._state.results.append({
+                    "email": email,
+                    "status": result,
+                    "error": error or "",
+                    "returnCode": return_code,
+                    "startedAt": started_at,
+                    "finishedAt": finished_at,
+                })
+                self._state.results = self._state.results[-500:]
+                self._state.current_pid = None
+                self._state.updated_at = now_iso()
+
+            if result == "success":
+                self.append_log(f"第 {index + 1}/{len(emails)} 个完成: {email}")
+                self._advance_queue_cursor(index)
+            elif result == "stopped":
+                self.append_log(f"第 {index + 1}/{len(emails)} 个已停止: {email}", level="warn")
+                break
+            else:
+                self.append_log(f"第 {index + 1}/{len(emails)} 个失败: {email} ({error or return_code})", level="error")
+                if error:
+                    self._add_error(error)
+
+        with self._lock:
+            self._state.running = False
+            self._state.phase = "stopped" if self._stop_event.is_set() else "done"
+            self._state.current_step = ""
+            self._state.current_email = ""
+            self._state.current_pid = None
+            self._state.updated_at = now_iso()
+        self.append_log(f"free突破 任务结束: 成功 {self._state.success} / 失败 {self._state.failed}")
+
+    def _run_one(self, email: str, options: dict[str, Any]) -> tuple[str, str | None, int | None]:
+        command = [
+            sys.executable,
+            "-u",
+            str(ROOT / "free_breakthrough.py"),
+            "--email", email,
+            "--sub2api-base-url", str(options.get("sub2apiBaseUrl") or app_config_value("SUB2API_BASE_URL", "")),
+            "--sub2api-admin-key", str(options.get("sub2apiAdminKey") or app_config_value("SUB2API_ADMIN_API_KEY", "")),
+        ]
+        proxy = str(
+            options.get("proxy")
+            or CONFIG.uc_signup_proxy
+            or CONFIG.browser_proxy
+        ).strip()
+        if proxy:
+            command.extend(["--proxy", proxy])
+        chrome_binary = str(options.get("chromeBinary") or CONFIG.uc_signup_chrome_binary).strip()
+        if chrome_binary:
+            command.extend(["--chrome-binary", chrome_binary])
+        chrome_version = str(options.get("chromeVersion") or CONFIG.uc_signup_chrome_version).strip()
+        if chrome_version:
+            command.extend(["--chrome-version", chrome_version])
+
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env["UC_SIGNUP_API_BASE"] = str(options.get("apiBase") or f"http://127.0.0.1:{CONFIG.port}")
+        env["UC_SIGNUP_DISPLAY"] = str(options.get("display") or CONFIG.browser_display)
+        if CONFIG.admin_password:
+            env["UC_SIGNUP_ADMIN_PASSWORD"] = CONFIG.admin_password
+        if proxy:
+            env["UC_SIGNUP_PROXY"] = proxy
+        for key, env_key in (
+            ("password", "SIGNUP_PASSWORD"),
+            ("name", "SIGNUP_NAME"),
+            ("age", "SIGNUP_AGE"),
+        ):
+            fallback = {
+                "password": CONFIG.signup_password,
+                "name": CONFIG.signup_name,
+                "age": CONFIG.signup_age,
+            }.get(key, "")
+            value = str(options.get(key) or fallback).strip()
+            if key == "name" and not options.get(key):
+                if random.random() < 0.5:
+                    names = ["simon", "jim", "alex", "mike", "tom", "jack", "ryan", "chris", "dan", "sam",
+                            "emma", "lisa", "anna", "kate", "lucy", "amy", "sara", "nina", "ella", "mia",
+                            "ben", "leo", "max", "luke", "eric", "mark", "paul", "alan", "carl", "dave"]
+                    value = random.choice(names)
+                else:
+                    length = random.randint(4, 5)
+                    value = "".join(random.choice(string.ascii_lowercase) for _ in range(length))
+            elif key == "age" and not options.get(key):
+                value = str(random.randint(20, 60))
+            if value:
+                env[env_key] = value
+
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(ROOT),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                start_new_session=True,
+            )
+        except Exception as error:
+            return ("fail", f"启动 free_breakthrough.py 失败: {error}", None)
+
+        with self._lock:
+            self._process = process
+            self._state.current_pid = process.pid
+            self._state.updated_at = now_iso()
+
+        if process.stdout:
+            for raw_line in process.stdout:
+                line = raw_line.rstrip("\r\n")
+                if line:
+                    self._handle_process_line(line)
+
+        return_code = process.wait()
+        with self._lock:
+            if self._process is process:
+                self._process = None
+
+        if self._stop_event.is_set():
+            return ("stopped", "已停止", return_code)
+        if return_code == 0:
+            return ("success", None, return_code)
+        return ("fail", f"free_breakthrough.py 退出码 {return_code}", return_code)
+
+    def _handle_process_line(self, line: str) -> None:
+        level = "error" if any(token in line for token in ("失敗", "ERROR", "异常")) else "warn" if "WARN" in line else "info"
+        self.append_log(line, level=level)
+        step = self._infer_step(line)
+        if step:
+            self._update_state(current_step=step)
+
+    def _infer_step(self, line: str) -> str:
+        checks = [
+            ("导入成功", "imported"),
+            ("Agent Identity 注册成功", "agent_registered"),
+            ("提取 session 成功", "session_extracted"),
+            ("注册完成", "signup_done"),
+            ("姓名年龄", "filling_account_details"),
+            ("填密码", "filling_password"),
+            ("邮箱码", "filling_email_code"),
+            ("邮箱", "filling_email"),
+            ("打开", "opening_signup"),
+        ]
+        for needle, step in checks:
+            if needle in line:
+                return step
+        return ""
+
+    def _advance_queue_cursor(self, index: int) -> None:
+        try:
+            queue = load_email_queue()
+            emails = queue.get("emails") or []
+            if emails:
+                save_email_queue({**queue, "cursor": min(index + 1, len(emails) - 1)})
+        except Exception:
+            pass
+
+    def _terminate_process(self, process: subprocess.Popen | None) -> None:
+        if not process or process.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                process.terminate()
+            except Exception:
+                return
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except Exception:
+                process.kill()
+            process.wait(timeout=5)
+
+
+FREE_BREAKTHROUGH_MANAGER = FreeBreakthroughManager()
+
+
 CONTROL_PANEL_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><title>fuckoai Linux</title></head>
@@ -3032,6 +3370,10 @@ class AppHandler(BaseHTTPRequestHandler):
                         "ucSignupStart": "POST /api/uc-signup/start",
                         "ucSignupStop": "POST /api/uc-signup/stop",
                         "ucSignupLogs": "GET /api/uc-signup/logs",
+                        "fbStatus": "GET /api/free-breakthrough/status",
+                        "fbStart": "POST /api/free-breakthrough/start",
+                        "fbStop": "POST /api/free-breakthrough/stop",
+                        "fbLogs": "GET /api/free-breakthrough/logs",
                     }
                 },
             )
@@ -3076,6 +3418,47 @@ class AppHandler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/api/uc-signup/logs":
             self.send_json(200, {"logs": UC_SIGNUP_MANAGER.get_logs()})
             return
+
+        if method == "GET" and path == "/api/free-breakthrough/status":
+            self.send_json(200, {"fbState": FREE_BREAKTHROUGH_MANAGER.get_state()})
+            return
+
+        if method == "POST" and path == "/api/free-breakthrough/start":
+            body = self.read_json_body()
+            emails = normalize_email_lines(body.get("emails", []))
+            if not emails:
+                queue = load_email_queue()
+                emails = normalize_email_lines(queue.get("emails", []))
+            if not emails:
+                self.send_json(400, {"error": "没有可注册的邮箱，请先生成邮箱列表"})
+                return
+            result = FREE_BREAKTHROUGH_MANAGER.start(
+                emails,
+                sub2apiBaseUrl=body.get("sub2apiBaseUrl"),
+                sub2apiAdminKey=body.get("sub2apiAdminKey"),
+                proxy=body.get("proxy"),
+                chromeBinary=body.get("chromeBinary"),
+                chromeVersion=body.get("chromeVersion"),
+                password=body.get("password"),
+                name=body.get("name"),
+                age=body.get("age"),
+            )
+            if "error" in result:
+                self.send_json(409, result)
+                return
+            queue = load_email_queue()
+            queue = save_email_queue({**queue, "cursor": 0, "activeEmail": emails[0] if emails else ""})
+            self.send_json(200, {"fbState": result["fbState"], "emailQueue": queue})
+            return
+
+        if method == "POST" and path == "/api/free-breakthrough/stop":
+            self.send_json(200, FREE_BREAKTHROUGH_MANAGER.stop())
+            return
+
+        if method == "GET" and path == "/api/free-breakthrough/logs":
+            self.send_json(200, {"logs": FREE_BREAKTHROUGH_MANAGER.get_logs()})
+            return
+
 
         self.send_json(404, {"error": "接口不存在"})
 

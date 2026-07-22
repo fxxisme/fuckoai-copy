@@ -320,6 +320,7 @@
         <button class="active" data-page="tasks">注册任务查看</button>
         <button data-page="settings">设置</button>
         <button data-page="outputPage">输出</button>
+        <button data-page="freeBreakthrough">free突破</button>
       </nav>
     </aside>
     <div id="overlay" class="overlay"></div>
@@ -393,7 +394,81 @@
             <pre id="ucSignupLogOutput" style="margin-top:10px"></pre>
           </section>
         </div>
+
+      <main id="freeBreakthrough" class="page">
+        <section>
+          <h3>free突破 任务</h3>
+          <div class="metrics">
+            <div class="metric"><b>状态</b><span id="fbPhase">空闲</span></div>
+            <div class="metric"><b>进度</b><span id="fbProgress">0/0</span></div>
+            <div class="metric"><b>当前步骤</b><span id="fbCurrentStep">--</span></div>
+            <div class="metric"><b>当前邮箱</b><span id="fbCurrentEmail">--</span></div>
+            <div class="metric"><b>结果</b><span id="fbResultsSummary">成功 0 / 失败 0</span></div>
+          </div>
+          <div class="row" style="margin-top:12px">
+            <button id="fbStartBtn" class="primary">开启新任务</button>
+            <button id="fbStopBtn" class="danger" disabled>停止任务</button>
+            <button id="fbRefreshBtn">刷新任务</button>
+          </div>
+        </section>
+
+        <div class="grid">
+          <section>
+            <h3>生成新邮箱</h3>
+            <div class="grid-3">
+              <div class="field">
+                <label for="fbEmailTotal">数量</label>
+                <input id="fbEmailTotal" value="1" inputmode="numeric">
+              </div>
+              <div class="field">
+                <label for="fbEmailCurrent">当前邮箱</label>
+                <input id="fbEmailCurrent" placeholder="启动后显示">
+              </div>
+              <div class="field">
+                <label for="fbRandomPrefix">邮箱前缀（可选）</label>
+                <input id="fbRandomPrefix" placeholder="user-" autocomplete="off">
+              </div>
+            </div>
+            <div class="field">
+              <label for="fbRandomDomain">邮箱后缀域名</label>
+              <input id="fbRandomDomain" placeholder="example.com" autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="fbEmailQueueText">待注册邮箱列表，一行一个</label>
+              <textarea id="fbEmailQueueText" spellcheck="false"></textarea>
+            </div>
+            <div class="row">
+              <button id="fbGenerateEmailQueueBtn">生成列表</button>
+              <button id="fbSaveEmailQueueBtn">保存列表</button>
+              <button id="fbLoadEmailQueueBtn">加载列表</button>
+              <button id="fbMailCodeBtn">查邮箱验证码</button>
+            </div>
+            <p id="fbEmailQueueState" class="muted">--</p>
+          </section>
+
+          <section>
+            <h3>sub2api 配置</h3>
+            <div class="field">
+              <label for="fbSub2apiBaseUrl">sub2api 基础地址</label>
+              <input id="fbSub2apiBaseUrl" placeholder="https://sub2api.example.com" autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="fbSub2apiAdminKey">sub2api 管理秘钥</label>
+              <input id="fbSub2apiAdminKey" type="password" placeholder="admin-xxx" autocomplete="off">
+            </div>
+            <div class="row">
+              <button id="fbSaveSub2apiBtn">保存配置</button>
+            </div>
+          </section>
+        </div>
+
+        <section>
+          <h3>任务日志</h3>
+          <textarea id="fbResultText" readonly style="min-height:110px"></textarea>
+          <pre id="fbLogOutput" style="margin-top:10px"></pre>
+        </section>
       </main>
+
 
       <main id="settings" class="page">
         <section>
@@ -467,6 +542,7 @@
       tasks: "注册任务查看",
       settings: "设置",
       outputPage: "输出",
+      freeBreakthrough: "free突破",
     };
     const appSettingKeys = [
       "HOST", "PORT",
@@ -1097,6 +1173,148 @@
       log(payload);
     }
 
+    let fbPollTimer = null;
+    const FB_STEP_LABELS = {
+      starting: "启动脚本",
+      opening_signup: "打开注册页",
+      filling_email: "填写邮箱",
+      filling_email_code: "填写邮箱验证码",
+      filling_password: "填写密码",
+      filling_account_details: "填写姓名年龄",
+      signup_done: "注册完成",
+      session_extracted: "提取 Session",
+      agent_registered: "Agent Identity 注册",
+      imported: "导入 sub2api",
+      completed: "完成",
+    };
+
+    function renderFbResults(state) {
+      const results = state.results || [];
+      $("fbResultText").value = results.length
+        ? results.map((item, index) => {
+            const status = item.status === "success" ? "成功" : item.status === "stopped" ? "已停止" : "失败";
+            const suffix = item.error ? ` - ${item.error}` : "";
+            return `${index + 1}. [${status}] ${item.email || "--"}${suffix}`;
+          }).join("\n")
+        : "";
+    }
+
+    async function refreshFbLogs() {
+      const payload = await requestJSON("GET", "/api/free-breakthrough/logs");
+      const logs = payload.logs || [];
+      $("fbLogOutput").textContent = logs.map((entry) => {
+        const timestamp = (entry.time || "").slice(11, 19) || "--:--:--";
+        const prefix = entry.level === "error" ? "ERROR" : entry.level === "warn" ? "WARN " : "INFO ";
+        return `[${timestamp}] ${prefix} ${entry.message || ""}`;
+      }).join("\n");
+      $("fbLogOutput").scrollTop = $("fbLogOutput").scrollHeight;
+    }
+
+    async function refreshFbStatus() {
+      const payload = await requestJSON("GET", "/api/free-breakthrough/status");
+      const state = payload.fbState || payload;
+      $("fbPhase").textContent = PHASE_LABELS[state.phase] || state.phase || "空闲";
+      $("fbProgress").textContent = `${state.completed || 0}/${state.total || 0}`;
+      $("fbCurrentEmail").textContent = state.currentEmail || "--";
+      $("fbCurrentStep").textContent = FB_STEP_LABELS[state.currentStep] || state.currentStep || "--";
+      $("fbResultsSummary").textContent = `成功 ${state.success || 0} / 失败 ${state.failed || 0}`;
+      renderFbResults(state);
+      try { await refreshFbLogs(); } catch (error) {}
+      const running = Boolean(state.running);
+      $("fbStartBtn").disabled = running;
+      $("fbStopBtn").disabled = !running;
+      if (running && !fbPollTimer) {
+        fbPollTimer = setInterval(() => run(refreshFbStatus), 3000);
+      }
+      if (!running && fbPollTimer) {
+        clearInterval(fbPollTimer);
+        fbPollTimer = null;
+      }
+    }
+
+    async function startFb() {
+      await saveFbEmailQueue();
+      const body = {
+        password: $("cfg_SIGNUP_PASSWORD") ? $("cfg_SIGNUP_PASSWORD").value.trim() : "",
+        name: $("cfg_SIGNUP_NAME") ? $("cfg_SIGNUP_NAME").value.trim() : "",
+        age: $("cfg_SIGNUP_AGE") ? $("cfg_SIGNUP_AGE").value.trim() : "",
+        sub2apiBaseUrl: $("fbSub2apiBaseUrl").value.trim(),
+        sub2apiAdminKey: $("fbSub2apiAdminKey").value.trim(),
+      };
+      const payload = await requestJSON("POST", "/api/free-breakthrough/start", body);
+      updateEmailQueueUI(payload.emailQueue || {});
+      updateFbEmailQueueUI(payload.emailQueue || {});
+      log({ message: "free突破 任务已启动", fbState: payload.fbState });
+      await refreshFbStatus();
+    }
+
+    async function stopFb() {
+      const payload = await requestJSON("POST", "/api/free-breakthrough/stop", {});
+      log({ message: "已请求停止 free突破 任务", fbState: payload.fbState });
+      await refreshFbStatus();
+    }
+
+    async function loadFbEmailQueue() {
+      const payload = await requestJSON("GET", "/api/email-queue");
+      updateFbEmailQueueUI(payload.emailQueue || {});
+    }
+
+    function updateFbEmailQueueUI(queue = {}) {
+      $("fbEmailQueueText").value = (queue.emails || []).join("\n");
+      const domain = queue.domain || "";
+      if (domain && !$("fbRandomDomain").value) $("fbRandomDomain").value = domain;
+      const total = (queue.emails || []).length;
+      $("fbEmailQueueState").textContent = `共 ${total} 个邮箱`;
+    }
+
+    async function generateFbEmailQueue() {
+      const total = parseInt($("fbEmailTotal").value) || 1;
+      const prefix = $("fbRandomPrefix").value.trim();
+      const domain = $("fbRandomDomain").value.trim();
+      if (!domain) throw new Error("请填写邮箱后缀域名");
+      const body = { total, prefix, domain };
+      const payload = await requestJSON("POST", "/api/email-queue/generate", body);
+      updateFbEmailQueueUI(payload.emailQueue || {});
+      log({ message: `已生成 ${total} 个邮箱`, emailQueue: payload.emailQueue });
+    }
+
+    async function saveFbEmailQueue() {
+      const emails = $("fbEmailQueueText").value.split(/[\n,;]+/).map(e => e.trim()).filter(Boolean);
+      const domain = $("fbRandomDomain").value.trim();
+      const prefix = $("fbRandomPrefix").value.trim();
+      const payload = await requestJSON("POST", "/api/email-queue", { emails, domain, prefix });
+      updateFbEmailQueueUI(payload.emailQueue || {});
+      log({ message: "邮箱列表已保存" });
+    }
+
+    async function loadFbEmailQueueData() {
+      await loadFbEmailQueue();
+      log({ message: "邮箱列表已加载" });
+    }
+
+    async function refreshFbEmailCode() {
+      const email = $("fbEmailCurrent").value.trim() || $("fbEmailQueueText").value.split(/[\n,;]+/)[0]?.trim();
+      if (!email) { log("没有可查的邮箱"); return; }
+      const payload = await requestJSON("GET", `/api/email-queue/mail/latest?address=${encodeURIComponent(email)}`);
+      log({ message: `邮箱 ${email} 最新邮件`, mail: payload });
+    }
+
+    async function saveFbSub2apiConfig() {
+      const body = {
+        SUB2API_BASE_URL: $("fbSub2apiBaseUrl").value.trim(),
+        SUB2API_ADMIN_API_KEY: $("fbSub2apiAdminKey").value.trim(),
+      };
+      await requestJSON("POST", "/api/app-settings", body);
+      log({ message: "sub2api 配置已保存" });
+    }
+
+    async function loadFbSub2apiConfig() {
+      const settings = await requestJSON("GET", "/api/app-settings");
+      $("fbSub2apiBaseUrl").value = settings.SUB2API_BASE_URL || "";
+      $("fbSub2apiAdminKey").value = settings.SUB2API_ADMIN_API_KEY || "";
+    }
+
+
     let ucSignupPollTimer = null;
     const PHASE_LABELS = { idle: "空闲", running: "运行中", stopping: "停止中", stopped: "已停止", done: "已完成" };
     const UC_SIGNUP_STEP_LABELS = {
@@ -1174,14 +1392,18 @@
       updateEmailQueueUI(payload.emailQueue || {});
       log({ message: "UC 注册任务已启动", ucSignupState: payload.ucSignupState });
       await refreshUcSignupStatus();
+      await refreshFbStatus();
+      await loadFbSub2apiConfig();
+      await loadFbEmailQueue();
     }
-
     async function stopUcSignup() {
       const payload = await requestJSON("POST", "/api/uc-signup/stop", {});
       log({ message: "已请求停止 UC 注册任务", ucSignupState: payload.ucSignupState });
       await refreshUcSignupStatus();
+      await refreshFbStatus();
+      await loadFbSub2apiConfig();
+      await loadFbEmailQueue();
     }
-
     async function run(task) {
       try { await task(); } catch (error) { log(`ERROR: ${error.message || error}`); }
     }
@@ -1192,8 +1414,10 @@
       await loadEmailQueue();
       await loadSettings();
       await refreshUcSignupStatus();
+      await refreshFbStatus();
+      await loadFbSub2apiConfig();
+      await loadFbEmailQueue();
     }
-
     for (const node of document.querySelectorAll(".nav button")) {
       node.onclick = () => switchPage(node.dataset.page);
     }
@@ -1220,6 +1444,14 @@
     $("ucSignupStartBtn").onclick = () => run(startUcSignup);
     $("ucSignupStopBtn").onclick = () => run(stopUcSignup);
     $("ucSignupRefreshBtn").onclick = () => run(refreshUcSignupStatus);
+    $("fbStartBtn").onclick = () => run(startFb);
+    $("fbStopBtn").onclick = () => run(stopFb);
+    $("fbRefreshBtn").onclick = () => run(refreshFbStatus);
+    $("fbGenerateEmailQueueBtn").onclick = () => run(generateFbEmailQueue);
+    $("fbSaveEmailQueueBtn").onclick = () => run(saveFbEmailQueue);
+    $("fbLoadEmailQueueBtn").onclick = () => run(loadFbEmailQueueData);
+    $("fbMailCodeBtn").onclick = () => run(refreshFbEmailCode);
+    $("fbSaveSub2apiBtn").onclick = () => run(saveFbSub2apiConfig);
 
     buildSettingsInputs();
     run(async () => {
