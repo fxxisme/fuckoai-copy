@@ -1,10 +1,10 @@
-name: fuckoai
+name: fuckoai-free-temp
 
 services:
-  fuckoai:
+  fuckoai-free-temp:
     build:
       context: .
-    container_name: fuckoai
+    container_name: fuckoai-free-temp
     init: true
     restart: unless-stopped
     network_mode: host
