@@ -4,8 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# 检测容器架构（用 --from=0 等价于在当前镜像里跑）
-COPY --from=0 /dev/null /dev/null 2>/dev/null; \
+# 检测容器架构
 RUN ARCH=$(uname -m); \
     echo "==> 容器架构: ${ARCH}"; \
     if [ "$ARCH" = "x86_64" ]; then \
