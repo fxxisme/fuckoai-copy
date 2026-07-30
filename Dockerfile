@@ -4,16 +4,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# 检测容器架构
-RUN ARCH=$(uname -m); \
-    echo "==> 容器架构: ${ARCH}"; \
-    if [ "$ARCH" = "x86_64" ]; then \
-        echo "==> x86_64 — 可使用默认下载"; \
-    elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then \
-        echo "==> ARM64 — 开始添加 arm64 多层源，某些包可能不够新"; \
-        dpkg --add-architecture arm64; \
-    fi
-
+# APT automatically resolves packages for the image's native architecture.
+# Do not add a foreign architecture here: it can select an incompatible driver.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         chromium \
@@ -33,15 +25,20 @@ RUN apt-get update \
         /usr/share/man/* \
         /usr/share/locale/*
 
-# 将系统 chromedriver 软链到 undetected_chromedriver 期望的路径，避免自动下载
-RUN ARCH=$(uname -m); \
-    if [ -f /usr/bin/chromedriver ]; then \
-        echo "==> 检测到系统 chromedriver，跳过自动下载"; \
-        mkdir -p /root/.local/share/undetected_chromedriver && \
-        ln -sf /usr/bin/chromedriver /root/.local/share/undetected_chromedriver/undetected_chromedriver; \
-    else \
-        echo "==> ⚠️ 系统 chromedriver 未找到，架构=${ARCH}，自带 undetected_chromedriver 自动下载"; \
-    fi
+# The Debian package is architecture-specific, so ARM64 images receive an ARM64
+# driver and AMD64 images receive an AMD64 driver. Clear any cached UC driver
+# before linking it to the verified system driver.
+RUN set -eux; \
+    container_arch="$(dpkg --print-architecture)"; \
+    driver_arch="$(dpkg-query -W -f='${Architecture}' chromium-driver)"; \
+    test "$container_arch" = "$driver_arch"; \
+    test -x /usr/bin/chromedriver; \
+    echo "==> 容器架构: ${container_arch}"; \
+    chromium --version; \
+    chromedriver --version; \
+    rm -rf /root/.local/share/undetected_chromedriver; \
+    mkdir -p /root/.local/share/undetected_chromedriver; \
+    ln -s /usr/bin/chromedriver /root/.local/share/undetected_chromedriver/undetected_chromedriver
 
 RUN pip install --no-cache-dir --no-compile \
         selenium \
