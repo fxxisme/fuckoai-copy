@@ -61,6 +61,7 @@ def detect_chrome_version(binary):
 
 CHROME_BINARY = detect_chrome_binary()
 CHROME_VERSION = detect_chrome_version(CHROME_BINARY)
+CHROMEDRIVER_BINARY = os.getenv("UC_SIGNUP_CHROMEDRIVER", "/usr/bin/chromedriver").strip()
 
 # ── 工具函数 ────────────────────────────────────────────
 def log(msg, level="info"):
@@ -148,7 +149,14 @@ class SignupBot:
             args.append(f"--proxy-server={PROXY}")
         for a in args:
             opts.add_argument(a)
-        self.d = uc.Chrome(options=opts, version_main=CHROME_VERSION)
+        if not os.path.isfile(CHROMEDRIVER_BINARY) or not os.access(CHROMEDRIVER_BINARY, os.X_OK):
+            raise RuntimeError(f"chromedriver 不可执行: {CHROMEDRIVER_BINARY}")
+        log(f"  chromedriver={CHROMEDRIVER_BINARY}")
+        self.d = uc.Chrome(
+            options=opts,
+            version_main=CHROME_VERSION,
+            driver_executable_path=CHROMEDRIVER_BINARY,
+        )
         log(f"  webdriver={self.d.execute_script('return navigator.webdriver')}")
 
     # ── 页面等待 ────────────────────────────────────────
