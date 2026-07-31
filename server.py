@@ -160,9 +160,19 @@ def load_json_file(path: Path) -> dict[str, Any]:
 
 def save_json_file(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temp_path.replace(path)
+    try:
+        temp_path.write_text(data, encoding="utf-8")
+        temp_path.replace(path)
+    except OSError:
+        # 单文件 bind mount（如 docker -v ./config.json:/app/config.json）不允许 rename 覆盖挂载点，
+        # 退化为直接写原文件。
+        path.write_text(data, encoding="utf-8")
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def load_config_values() -> dict[str, str]:
