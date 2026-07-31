@@ -27,13 +27,34 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parent
 APP_NAME = "fuckoai"
 CONFIG_PATH = ROOT / "config.json"
-PURCHASE_CONFIG_PATH = ROOT / "data/purchase_config.json"
 CONTROL_PANEL_PATH = ROOT / "control_panel.html"
 EMAIL_QUEUE_PATH = ROOT / "data/email_queue.json"
-CATALOG_CACHE_PATH = ROOT / "data/catalog_cache.json"
 SIGNUP_URL = "https://chatgpt.com/auth/login?intent=signup"
 DEFAULT_SERVICE_NAME = "OpenAI"
 DEFAULT_SERVICE_CODE = "dr"
+
+SMS_PROVIDERS = ("hero", "bower")
+
+
+def purchase_config_path_for(provider: str) -> Path:
+    key = str(provider or "hero").strip().lower()
+    name = "purchase_config.json" if key == "hero" else f"purchase_config_{key}.json"
+    return (ROOT / "data" / name).resolve()
+
+
+def catalog_cache_path_for(provider: str) -> Path:
+    key = str(provider or "hero").strip().lower()
+    name = "catalog_cache.json" if key == "hero" else f"catalog_cache_{key}.json"
+    return (ROOT / "data" / name).resolve()
+
+
+def normalize_sms_provider(value: Any) -> str:
+    key = str(value or "hero").strip().lower()
+    if key in {"smsbower", "bower", "sb"}:
+        return "bower"
+    return "hero"
+
+
 PURCHASE_FILTER_KEYS = (
     "serviceName",
     "serviceCode",
@@ -51,6 +72,9 @@ APP_SETTING_FIELDS = (
     "PORT",
     "HERO_SMS_API_KEY",
     "HERO_SMS_API_URL",
+    "SMSBOWER_API_KEY",
+    "SMSBOWER_API_URL",
+    "SMS_PROVIDER",
     "TEMP_MAIL_API_URL",
     "TEMP_MAIL_ADMIN_PASSWORD",
     "CPA_BASE_URL",
@@ -78,6 +102,9 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
     "PORT": "3030",
     "HERO_SMS_API_KEY": "",
     "HERO_SMS_API_URL": "https://hero-sms.com/stubs/handler_api.php",
+    "SMSBOWER_API_KEY": "",
+    "SMSBOWER_API_URL": "https://smsbower.page/stubs/handler_api.php",
+    "SMS_PROVIDER": "hero",
     "TEMP_MAIL_API_URL": "",
     "TEMP_MAIL_ADMIN_PASSWORD": "",
     "CPA_BASE_URL": "",
@@ -231,8 +258,11 @@ class UcSignupState:
 class Config:
     host: str = app_config_value("HOST", "0.0.0.0")
     port: int = int(app_config_value("PORT", "3030"))
-    api_key: str = app_config_value("HERO_SMS_API_KEY", "")
-    api_url: str = app_config_value("HERO_SMS_API_URL", "https://hero-sms.com/stubs/handler_api.php")
+    hero_api_key: str = app_config_value("HERO_SMS_API_KEY", "")
+    hero_api_url: str = app_config_value("HERO_SMS_API_URL", "https://hero-sms.com/stubs/handler_api.php")
+    bower_api_key: str = app_config_value("SMSBOWER_API_KEY", "")
+    bower_api_url: str = app_config_value("SMSBOWER_API_URL", "https://smsbower.page/stubs/handler_api.php")
+    sms_provider: str = app_config_value("SMS_PROVIDER", "hero")
     default_service_name: str = DEFAULT_SERVICE_NAME
     default_service_code: str = DEFAULT_SERVICE_CODE
     default_service_aliases: list[str] = None
@@ -246,7 +276,7 @@ class Config:
     timeout_ms: int = int(app_config_value("REQUEST_TIMEOUT_MS", "15000"))
     enable_cors: bool = app_config_value("ENABLE_CORS", "true").lower() == "true"
     store_file: Path = ROOT / app_config_value("STORE_FILE", "./data/activations.json")
-    purchase_config_file: Path = PURCHASE_CONFIG_PATH
+    purchase_config_file: Path = purchase_config_path_for("hero")
     temp_mail_api_url: str = app_config_value("TEMP_MAIL_API_URL", "")
     temp_mail_admin_password: str = app_config_value("TEMP_MAIL_ADMIN_PASSWORD", "")
     cpa_base_url: str = app_config_value("CPA_BASE_URL", "")
@@ -273,7 +303,8 @@ class Config:
         ]
         self.default_country_aliases = []
         self.store_file = (ROOT / app_config_value("STORE_FILE", "./data/activations.json")).resolve()
-        self.purchase_config_file = (ROOT / app_config_value("PURCHASE_CONFIG_FILE", "./data/purchase_config.json")).resolve()
+        self.sms_provider = normalize_sms_provider(app_config_value("SMS_PROVIDER", "hero"))
+        self.purchase_config_file = purchase_config_path_for(self.sms_provider)
         self.temp_mail_api_url = app_config_value("TEMP_MAIL_API_URL", "").rstrip("/")
         self.temp_mail_admin_password = app_config_value("TEMP_MAIL_ADMIN_PASSWORD", "")
         self.cpa_base_url = app_config_value("CPA_BASE_URL", "").rstrip("/")
@@ -978,6 +1009,19 @@ class HeroSmsClient:
         }
 
 
+class SmsBowerClient(HeroSmsClient):
+    """SMSBower 接口客户端。
+
+    SMSBower 的 handler_api 与 hero-sms 协议兼容（getBalance / getNumber /
+    getNumberV2 / getStatus / setStatus / getPrices / getServicesList /
+    getCountries 等动作完全一致），故直接继承 HeroSmsClient。
+    若后续需要调用 SMSBower 特有接口（getPricesV2/V3、
+    getTopCountriesByService、getActualWalletAddress 等），在此扩展。
+    """
+
+    pass
+
+
 class TempMailClient:
     def __init__(self, base_url: str, admin_password: str, timeout_ms: int) -> None:
         self.base_url = base_url.rstrip("/")
@@ -1154,21 +1198,60 @@ class CpaClient:
         return self._request("GET", "/v0/management/auth-files")
 
 
-CLIENT = HeroSmsClient(CONFIG.api_key, CONFIG.api_url, CONFIG.timeout_ms)
+CLIENTS: dict[str, HeroSmsClient] = {}
 TEMP_MAIL = TempMailClient(CONFIG.temp_mail_api_url, CONFIG.temp_mail_admin_password, CONFIG.timeout_ms)
 CPA = CpaClient(CONFIG.cpa_base_url, CONFIG.cpa_management_key, CONFIG.timeout_ms)
 PURCHASE_GROUP_CURSOR_LOCK = threading.Lock()
 PURCHASE_GROUP_NEXT_INDEX = 0
 
 
+def build_sms_client(provider: str) -> HeroSmsClient:
+    key = normalize_sms_provider(provider)
+    if key == "bower":
+        return SmsBowerClient(CONFIG.bower_api_key, CONFIG.bower_api_url, CONFIG.timeout_ms)
+    return HeroSmsClient(CONFIG.hero_api_key, CONFIG.hero_api_url, CONFIG.timeout_ms)
+
+
+def reload_sms_clients() -> None:
+    global CLIENTS
+    CLIENTS = {provider: build_sms_client(provider) for provider in SMS_PROVIDERS}
+
+
+def get_client(provider: str | None = None) -> HeroSmsClient:
+    key = normalize_sms_provider(provider or CONFIG.sms_provider)
+    if key not in CLIENTS:
+        CLIENTS[key] = build_sms_client(key)
+    return CLIENTS[key]
+
+
+def current_provider() -> str:
+    return normalize_sms_provider(CONFIG.sms_provider)
+
+
+# 向后兼容：CLIENT 指向当前选中 provider 的客户端
+class _CurrentClientProxy:
+    def _target(self) -> HeroSmsClient:
+        return get_client(current_provider())
+
+    def __getattr__(self, item):
+        return getattr(self._target(), item)
+
+
+CLIENT = _CurrentClientProxy()  # type: ignore[assignment]
+reload_sms_clients()
+
+
 def reload_runtime_config() -> None:
-    global APP_CONFIG_VALUES, CLIENT, TEMP_MAIL, CPA
+    global APP_CONFIG_VALUES, TEMP_MAIL, CPA
 
     APP_CONFIG_VALUES = load_config_values()
     CONFIG.host = app_config_value("HOST", "0.0.0.0")
     CONFIG.port = int(app_config_value("PORT", str(CONFIG.port)))
-    CONFIG.api_key = app_config_value("HERO_SMS_API_KEY", "")
-    CONFIG.api_url = app_config_value("HERO_SMS_API_URL", "https://hero-sms.com/stubs/handler_api.php")
+    CONFIG.hero_api_key = app_config_value("HERO_SMS_API_KEY", "")
+    CONFIG.hero_api_url = app_config_value("HERO_SMS_API_URL", "https://hero-sms.com/stubs/handler_api.php")
+    CONFIG.bower_api_key = app_config_value("SMSBOWER_API_KEY", "")
+    CONFIG.bower_api_url = app_config_value("SMSBOWER_API_URL", "https://smsbower.page/stubs/handler_api.php")
+    CONFIG.sms_provider = normalize_sms_provider(app_config_value("SMS_PROVIDER", "hero"))
     CONFIG.default_service_name = DEFAULT_SERVICE_NAME
     CONFIG.default_service_code = DEFAULT_SERVICE_CODE
     CONFIG.default_country_name = ""
@@ -1180,7 +1263,8 @@ def reload_runtime_config() -> None:
     CONFIG.timeout_ms = int(app_config_value("REQUEST_TIMEOUT_MS", str(CONFIG.timeout_ms)))
     CONFIG.enable_cors = app_config_value("ENABLE_CORS", "true").lower() == "true"
     CONFIG.store_file = (ROOT / app_config_value("STORE_FILE", "./data/activations.json")).resolve()
-    CONFIG.purchase_config_file = (ROOT / app_config_value("PURCHASE_CONFIG_FILE", "./data/purchase_config.json")).resolve()
+    CONFIG.sms_provider = normalize_sms_provider(app_config_value("SMS_PROVIDER", "hero"))
+    CONFIG.purchase_config_file = purchase_config_path_for(CONFIG.sms_provider)
     CONFIG.temp_mail_api_url = app_config_value("TEMP_MAIL_API_URL", "").rstrip("/")
     CONFIG.temp_mail_admin_password = app_config_value("TEMP_MAIL_ADMIN_PASSWORD", "")
     CONFIG.cpa_base_url = app_config_value("CPA_BASE_URL", "").rstrip("/")
@@ -1199,7 +1283,7 @@ def reload_runtime_config() -> None:
     CONFIG.signup_age = app_config_value("SIGNUP_AGE", "18")
     CONFIG.admin_password = os.getenv("ADMIN_PASSWORD", "")
 
-    CLIENT = HeroSmsClient(CONFIG.api_key, CONFIG.api_url, CONFIG.timeout_ms)
+    reload_sms_clients()
     TEMP_MAIL = TempMailClient(CONFIG.temp_mail_api_url, CONFIG.temp_mail_admin_password, CONFIG.timeout_ms)
     CPA = CpaClient(CONFIG.cpa_base_url, CONFIG.cpa_management_key, CONFIG.timeout_ms)
 
@@ -1711,8 +1795,8 @@ def get_purchase_defaults() -> dict[str, Any]:
     }
 
 
-def get_purchase_config() -> dict[str, Any]:
-    file_config = load_json_file(CONFIG.purchase_config_file)
+def get_purchase_config(provider: str | None = None) -> dict[str, Any]:
+    file_config = load_json_file(purchase_config_path_for(normalize_sms_provider(provider)))
     defaults = get_purchase_defaults()
     settings = get_purchase_settings(file_config=file_config, env_defaults=defaults)
     groups = get_enabled_purchase_groups(settings)
@@ -1754,9 +1838,13 @@ def is_early_cancel_denied_error(error: Exception | str) -> bool:
 
 
 def get_purchase_settings(
-    *, file_config: dict[str, Any] | None = None, env_defaults: dict[str, Any] | None = None
+    *,
+    file_config: dict[str, Any] | None = None,
+    env_defaults: dict[str, Any] | None = None,
+    provider: str | None = None,
 ) -> dict[str, Any]:
-    file_config = file_config if isinstance(file_config, dict) else load_json_file(CONFIG.purchase_config_file)
+    config_path = purchase_config_path_for(normalize_sms_provider(provider)) if file_config is None else None
+    file_config = file_config if isinstance(file_config, dict) else load_json_file(config_path or CONFIG.purchase_config_file)
     env_defaults = env_defaults or get_purchase_defaults()
     root_defaults = dict(env_defaults)
     for key in PURCHASE_FILTER_KEYS:
@@ -1853,12 +1941,12 @@ def serialize_purchase_settings(settings: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def update_purchase_settings(payload: dict[str, Any]) -> dict[str, Any]:
+def update_purchase_settings(payload: dict[str, Any], *, provider: str | None = None) -> dict[str, Any]:
     defaults = get_purchase_defaults()
-    settings = get_purchase_settings(file_config=payload, env_defaults=defaults)
+    settings = get_purchase_settings(file_config=payload, env_defaults=defaults, provider=provider)
     serialized = serialize_purchase_settings(settings)
-    save_json_file(CONFIG.purchase_config_file, serialized)
-    return get_purchase_settings(file_config=serialized, env_defaults=defaults)
+    save_json_file(purchase_config_path_for(normalize_sms_provider(provider)), serialized)
+    return get_purchase_settings(file_config=serialized, env_defaults=defaults, provider=provider)
 
 
 def get_display_name(source: dict[str, Any], *, name_key: str, code_key: str, default_name: str) -> str:
@@ -1897,12 +1985,12 @@ def get_country_search_fields(item: dict[str, Any]) -> list[str]:
     return fields
 
 
-def search_countries_by_name(name: str, limit: int = 8) -> list[dict[str, Any]]:
+def search_countries_by_name(name: str, limit: int = 8, *, provider: str | None = None) -> list[dict[str, Any]]:
     query = normalize_text(name)
     if not query:
         return []
     ranked: list[tuple[int, str, dict[str, Any]]] = []
-    for item in CLIENT.get_countries():
+    for item in get_client(provider).get_countries():
         fields = get_country_search_fields(item)
         score: int | None = None
         for field in fields:
@@ -1922,23 +2010,24 @@ def search_countries_by_name(name: str, limit: int = 8) -> list[dict[str, Any]]:
     return [item for _, _, item in ranked[:limit]]
 
 
-def load_catalog_cache() -> dict[str, Any]:
-    return load_json_file(CATALOG_CACHE_PATH)
+def load_catalog_cache(provider: str | None = None) -> dict[str, Any]:
+    return load_json_file(catalog_cache_path_for(normalize_sms_provider(provider)))
 
 
-def save_catalog_cache(cache: dict[str, Any]) -> dict[str, Any]:
-    save_json_file(CATALOG_CACHE_PATH, cache)
+def save_catalog_cache(cache: dict[str, Any], *, provider: str | None = None) -> dict[str, Any]:
+    save_json_file(catalog_cache_path_for(normalize_sms_provider(provider)), cache)
     return cache
 
 
-def get_cached_countries(*, refresh: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    cache = load_catalog_cache()
+def get_cached_countries(*, refresh: bool = False, provider: str | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    provider = normalize_sms_provider(provider)
+    cache = load_catalog_cache(provider)
     countries = cache.get("countries")
     if refresh or not isinstance(countries, list):
-        countries = CLIENT.get_countries(force=True)
+        countries = get_client(provider).get_countries(force=True)
         cache["countries"] = countries
         cache["countriesCachedAt"] = now_iso()
-        save_catalog_cache(cache)
+        save_catalog_cache(cache, provider=provider)
     return countries, cache
 
 
@@ -1969,8 +2058,9 @@ def search_country_items(items: list[dict[str, Any]], query_text: str, limit: in
     return [item for _, _, item in ranked[:limit]]
 
 
-def get_cached_operators(service_code: str, country_code: str, *, refresh: bool = False) -> tuple[list[str], dict[str, Any]]:
-    cache = load_catalog_cache()
+def get_cached_operators(service_code: str, country_code: str, *, refresh: bool = False, provider: str | None = None) -> tuple[list[str], dict[str, Any]]:
+    provider = normalize_sms_provider(provider)
+    cache = load_catalog_cache(provider)
     operators_cache = cache.get("operators")
     if not isinstance(operators_cache, dict):
         operators_cache = {}
@@ -1979,9 +2069,9 @@ def get_cached_operators(service_code: str, country_code: str, *, refresh: bool 
     cached_entry = operators_cache.get(cache_key)
     operators = cached_entry.get("items") if isinstance(cached_entry, dict) else None
     if refresh or not isinstance(operators, list):
-        operators = CLIENT.get_operators(service_code, country_code, force=True)
+        operators = get_client(provider).get_operators(service_code, country_code, force=True)
         operators_cache[cache_key] = {"items": operators, "cachedAt": now_iso()}
-        save_catalog_cache(cache)
+        save_catalog_cache(cache, provider=provider)
     return operators, cache
 
 
@@ -2001,7 +2091,8 @@ def find_by_code(items: list[dict[str, Any]], code: str) -> dict[str, Any] | Non
     return None
 
 
-def resolve_selections(filters: dict[str, str]) -> dict[str, Any]:
+def resolve_selections(filters: dict[str, str], *, provider: str | None = None) -> dict[str, Any]:
+    client = get_client(provider)
     service_code = str(filters.get("serviceCode") or "").strip()
     country_code = str(filters.get("countryCode") or "").strip()
     if service_code and country_code:
@@ -2016,12 +2107,12 @@ def resolve_selections(filters: dict[str, str]) -> dict[str, Any]:
             "countries": [],
         }
 
-    services = CLIENT.get_services()
-    countries = CLIENT.get_countries()
-    service = find_by_code(services, service_code) or CLIENT._pick_by_name(
+    services = client.get_services()
+    countries = client.get_countries()
+    service = find_by_code(services, service_code) or client._pick_by_name(
         services, filters["serviceName"], CONFIG.default_service_aliases, ("name", "code")
     )
-    country = find_by_code(countries, country_code) or CLIENT._pick_by_name(
+    country = find_by_code(countries, country_code) or client._pick_by_name(
         countries, filters["countryName"], CONFIG.default_country_aliases, ("name", "localName", "code")
     )
     if not service:
@@ -2031,19 +2122,20 @@ def resolve_selections(filters: dict[str, str]) -> dict[str, Any]:
     return {"service": service, "services": services, "country": country, "countries": countries}
 
 
-def build_service_lookup() -> dict[str, dict[str, Any]]:
-    return {str(item.get("code")): item for item in CLIENT.get_services()}
+def build_service_lookup(provider: str | None = None) -> dict[str, dict[str, Any]]:
+    return {str(item.get("code")): item for item in get_client(provider).get_services()}
 
 
-def build_country_lookup() -> dict[str, dict[str, Any]]:
-    return {str(item.get("code")): item for item in CLIENT.get_countries()}
+def build_country_lookup(provider: str | None = None) -> dict[str, dict[str, Any]]:
+    return {str(item.get("code")): item for item in get_client(provider).get_countries()}
 
 
-def import_active_activations() -> list[dict[str, Any]]:
-    service_lookup = build_service_lookup()
-    country_lookup = build_country_lookup()
+def import_active_activations(provider: str | None = None) -> list[dict[str, Any]]:
+    client = get_client(provider)
+    service_lookup = build_service_lookup(provider)
+    country_lookup = build_country_lookup(provider)
     imported = []
-    for item in CLIENT.get_active_activations():
+    for item in client.get_active_activations():
         activation_id = str(item.get("activationId") or item.get("id") or "")
         if not activation_id:
             continue
@@ -2079,11 +2171,12 @@ def import_active_activations() -> list[dict[str, Any]]:
     return imported
 
 
-def fetch_upstream_activations() -> list[dict[str, Any]]:
-    service_lookup = build_service_lookup()
-    country_lookup = build_country_lookup()
+def fetch_upstream_activations(provider: str | None = None) -> list[dict[str, Any]]:
+    client = get_client(provider)
+    service_lookup = build_service_lookup(provider)
+    country_lookup = build_country_lookup(provider)
     items = []
-    for item in CLIENT.get_active_activations():
+    for item in client.get_active_activations():
         activation_id = str(item.get("activationId") or item.get("id") or "")
         if not activation_id:
             continue
@@ -2151,8 +2244,9 @@ def filter_activations(
     return result
 
 
-def get_current_filtered_activations(filters: dict[str, str] | None = None) -> list[dict[str, Any]]:
-    items = fetch_upstream_activations()
+def get_current_filtered_activations(filters: dict[str, str] | None = None, *, provider: str | None = None) -> list[dict[str, Any]]:
+    provider = normalize_sms_provider(provider)
+    items = fetch_upstream_activations(provider)
     if filters:
         price = filters.get("exactPrice") or filters.get("price") or ""
         return filter_activations(
@@ -2163,7 +2257,7 @@ def get_current_filtered_activations(filters: dict[str, str] | None = None) -> l
             price=price,
         )
 
-    settings = get_purchase_settings()
+    settings = get_purchase_settings(provider=provider)
     matched: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for group in get_enabled_purchase_groups(settings):
@@ -2186,7 +2280,8 @@ def get_current_filtered_activations(filters: dict[str, str] | None = None) -> l
     return matched
 
 
-def build_purchase_attempts(source: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def build_purchase_attempts(source: dict[str, Any] | None = None, *, provider: str | None = None) -> list[dict[str, Any]]:
+    provider = normalize_sms_provider(provider)
     source = source if isinstance(source, dict) else {}
     if any(key in source for key in PURCHASE_FILTER_KEYS):
         filters = get_filters(source)
@@ -2197,7 +2292,7 @@ def build_purchase_attempts(source: dict[str, Any] | None = None) -> list[dict[s
             }
         ]
 
-    settings = get_purchase_settings()
+    settings = get_purchase_settings(provider=provider)
     groups = get_enabled_purchase_groups(settings)
     if not groups:
         raise HeroSmsError("未配置可用的 purchaseGroups")
@@ -2217,17 +2312,18 @@ def build_purchase_attempts(source: dict[str, Any] | None = None) -> list[dict[s
     return attempts
 
 
-def execute_purchase(filters: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any]]:
-    resolved = resolve_selections(filters)
+def execute_purchase(filters: dict[str, str], *, provider: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    client = get_client(provider)
+    resolved = resolve_selections(filters, provider=provider)
     if filters["fixedPrice"] == "true" and filters["exactPrice"]:
-        purchase = CLIENT.buy_activation_fixed_price(
+        purchase = client.buy_activation_fixed_price(
             service_code=resolved["service"]["code"],
             country_code=resolved["country"]["code"],
             operator=filters["operator"],
             exact_price=filters["exactPrice"],
         )
     else:
-        purchase = CLIENT.buy_activation(
+        purchase = client.buy_activation(
             service_code=resolved["service"]["code"],
             country_code=resolved["country"]["code"],
             operator=filters["operator"],
@@ -2267,15 +2363,17 @@ def build_purchase_item(
     return normalize_record(item)
 
 
-def purchase_with_fallback(source: dict[str, Any] | None = None) -> dict[str, Any]:
+def purchase_with_fallback(source: dict[str, Any] | None = None, *, provider: str | None = None) -> dict[str, Any]:
+    provider = normalize_sms_provider(provider)
     attempts_summary = []
     last_error: HeroSmsError | None = None
-    for index, attempt in enumerate(build_purchase_attempts(source), start=1):
+    for index, attempt in enumerate(build_purchase_attempts(source, provider=provider), start=1):
         filters = attempt["filters"]
         label = str(attempt.get("label") or build_purchase_group_label(filters, index=index))
         try:
-            purchase, resolved = execute_purchase(filters)
+            purchase, resolved = execute_purchase(filters, provider=provider)
             return {
+                "provider": provider,
                 "filters": filters,
                 "item": build_purchase_item(
                     purchase,
@@ -2312,16 +2410,16 @@ def purchase_with_fallback(source: dict[str, Any] | None = None) -> dict[str, An
     raise PurchaseError(f"所有购买配置都失败: {detail}", attempts_summary) from last_error
 
 
-def find_activation_by_phone(phone_number: str) -> dict[str, Any] | None:
+def find_activation_by_phone(phone_number: str, *, provider: str | None = None) -> dict[str, Any] | None:
     normalized = str(phone_number or "").strip()
     if not normalized:
         return None
-    items = fetch_upstream_activations()
+    items = fetch_upstream_activations(provider)
     return next((item for item in items if str(item.get("phoneNumber")) == normalized), None)
 
 
-def sync_record_status(record: dict[str, Any]) -> dict[str, Any]:
-    status = CLIENT.get_status(str(record["id"]))
+def sync_record_status(record: dict[str, Any], *, provider: str | None = None) -> dict[str, Any]:
+    status = get_client(provider).get_status(str(record["id"]))
     next_record = STORE.upsert(
         {
             **record,
@@ -2336,8 +2434,34 @@ def sync_record_status(record: dict[str, Any]) -> dict[str, Any]:
     return {"record": normalize_record(next_record), "status": status}
 
 
+def current_client_api_url() -> str:
+    provider = current_provider()
+    return CONFIG.bower_api_url if provider == "bower" else CONFIG.hero_api_url
+
+
+def build_providers_status() -> dict[str, dict[str, Any]]:
+    return {
+        "hero": {
+            "name": "HeroSMS",
+            "apiUrl": CONFIG.hero_api_url,
+            "configured": bool(CONFIG.hero_api_key),
+            "purchaseConfigFile": str(purchase_config_path_for("hero")),
+        },
+        "bower": {
+            "name": "SMSBower",
+            "apiUrl": CONFIG.bower_api_url,
+            "configured": bool(CONFIG.bower_api_key),
+            "purchaseConfigFile": str(purchase_config_path_for("bower")),
+        },
+    }
+
+
 class AppHandler(BaseHTTPRequestHandler):
     server_version = "fuckoai/1.0"
+
+    def _provider_from_request(self, query: dict[str, Any]) -> str:
+        # 优先用 query 参数显式指定，否则用当前选中的 provider
+        return normalize_sms_provider(query.get("provider") or current_provider())
 
     def is_authenticated(self) -> bool:
         if not CONFIG.admin_password:
@@ -2468,10 +2592,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "ok": True,
-                    "configured": bool(CONFIG.api_key),
+                    "configured": bool(get_client().api_key),
                     "tempMailConfigured": bool(CONFIG.temp_mail_api_url and CONFIG.temp_mail_admin_password),
                     "cpaConfigured": bool(CONFIG.cpa_base_url and CONFIG.cpa_management_key),
-                    "apiUrl": CONFIG.api_url,
+                    "apiUrl": current_client_api_url(),
+                    "smsProvider": current_provider(),
+                    "providers": build_providers_status(),
                     "purchaseConfigFile": str(CONFIG.purchase_config_file),
                     "purchaseConfig": get_purchase_config(),
                     "purchaseSettings": get_purchase_settings(),
@@ -2486,6 +2612,9 @@ class AppHandler(BaseHTTPRequestHandler):
                     "appSettings": get_app_settings(),
                     "purchaseConfig": get_purchase_config(),
                     "purchaseSettings": get_purchase_settings(),
+                    "smsProvider": current_provider(),
+                    "providers": build_providers_status(),
+                    "purchaseConfigFile": str(CONFIG.purchase_config_file),
                 },
             )
             return
@@ -2518,19 +2647,49 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json(200, refresh_active_email_mail(query.get("address")))
             return
 
+        if method == "GET" and path == "/api/sms-providers":
+            self.send_json(200, {"providers": build_providers_status(), "current": current_provider()})
+            return
+
+        if method == "POST" and path == "/api/sms-providers/current":
+            body = self.read_json_body()
+            requested = str(body.get("provider") or "").strip().lower()
+            normalized = normalize_sms_provider(requested)
+            current = current_provider()
+            # 写入配置，使其成为下次启动及当前运行时的默认 provider
+            values = load_config_values()
+            values["SMS_PROVIDER"] = normalized
+            write_config_values(values)
+            reload_runtime_config()
+            provider_state = build_providers_status().get(normalized, {})
+            self.send_json(
+                200,
+                {
+                    "previous": current,
+                    "current": normalized,
+                    "provider": provider_state,
+                    "purchaseSettings": get_purchase_settings(),
+                    "purchaseConfig": get_purchase_config(),
+                },
+            )
+            return
+
+        provider = self._provider_from_request(query)
+
         if method == "GET" and path == "/api/purchase-settings":
-            self.send_json(200, {"purchaseSettings": get_purchase_settings()})
+            self.send_json(200, {"purchaseSettings": get_purchase_settings(provider=provider)})
             return
 
         if method == "POST" and path == "/api/purchase-settings":
             body = self.read_json_body()
-            settings = update_purchase_settings(body)
-            self.send_json(200, {"purchaseSettings": settings, "purchaseConfig": get_purchase_config()})
+            target_provider = str(body.get("provider") or "").strip().lower() or provider
+            settings = update_purchase_settings(body, provider=target_provider)
+            self.send_json(200, {"purchaseSettings": settings, "purchaseConfig": get_purchase_config(provider=target_provider)})
             return
 
         if method == "GET" and path == "/api/purchase-catalog/countries":
             refresh = parse_bool_flag(query.get("refresh"), default=False)
-            countries, cache = get_cached_countries(refresh=refresh)
+            countries, cache = get_cached_countries(refresh=refresh, provider=provider)
             limit = parse_positive_int(query.get("limit"), default=len(countries))
             matches = search_country_items(countries, query.get("query", ""), limit=min(max(limit, 1), len(countries)))
             self.send_json(
@@ -2545,7 +2704,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if method == "POST" and path == "/api/purchase-catalog/countries/refresh":
-            countries, cache = get_cached_countries(refresh=True)
+            countries, cache = get_cached_countries(refresh=True, provider=provider)
             self.send_json(
                 200,
                 {
@@ -2558,13 +2717,13 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if method == "GET" and path == "/api/purchase-catalog/operators":
-            service_code = str(query.get("serviceCode") or get_purchase_settings().get("serviceCode") or DEFAULT_SERVICE_CODE).strip()
+            service_code = str(query.get("serviceCode") or get_purchase_settings(provider=provider).get("serviceCode") or DEFAULT_SERVICE_CODE).strip()
             country_code = str(query.get("countryCode") or "").strip()
             if not country_code:
                 self.send_json(400, {"error": "缺少 countryCode"})
                 return
             refresh = parse_bool_flag(query.get("refresh"), default=False)
-            operators, cache = get_cached_operators(service_code, country_code, refresh=refresh)
+            operators, cache = get_cached_operators(service_code, country_code, refresh=refresh, provider=provider)
             operator_entry = (cache.get("operators") or {}).get(f"{service_code}:{country_code}") or {}
             self.send_json(
                 200,
@@ -2652,12 +2811,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
 
         if method == "GET" and path == "/api/options":
-            defaults = get_purchase_config()
+            client = get_client(provider)
+            defaults = get_purchase_config(provider)
             self.send_json(
                 200,
                 {
-                    "services": CLIENT.get_services(),
-                    "countries": CLIENT.get_countries(),
+                    "services": client.get_services(),
+                    "countries": client.get_countries(),
                     "defaults": {
                         "serviceName": defaults.get("serviceName", ""),
                         "serviceCode": defaults.get("serviceCode", ""),
@@ -2674,13 +2834,13 @@ class AppHandler(BaseHTTPRequestHandler):
             if not name:
                 self.send_json(400, {"error": "缺少国家名称 name"})
                 return
-            service_code = str(query.get("serviceCode") or get_purchase_settings().get("serviceCode") or DEFAULT_SERVICE_CODE).strip()
-            matches = search_countries_by_name(name)
+            service_code = str(query.get("serviceCode") or get_purchase_settings(provider=provider).get("serviceCode") or DEFAULT_SERVICE_CODE).strip()
+            matches = search_countries_by_name(name, provider=provider)
             if not matches:
                 self.send_json(404, {"error": f"找不到国家/地区: {name}"})
                 return
             country = matches[0]
-            operators = CLIENT.get_operators(service_code, str(country.get("code") or ""))
+            operators = get_client(provider).get_operators(service_code, str(country.get("code") or ""))
             self.send_json(
                 200,
                 {
@@ -2696,16 +2856,16 @@ class AppHandler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/api/balance":
             force = str(query.get("force", "")).lower() in ("1", "true", "yes")
             try:
-                balance = CLIENT.get_balance_cached(force=force)
+                balance = get_client(provider).get_balance_cached(force=force)
             except HeroSmsError:
                 balance = None
-            self.send_json(200, {"balance": balance})
+            self.send_json(200, {"balance": balance, "provider": provider})
             return
 
         if method == "GET" and path == "/api/pricing":
             filters = get_filters(query)
-            resolved = resolve_selections(filters)
-            pricing = CLIENT.get_pricing(resolved["service"]["code"], resolved["country"]["code"])
+            resolved = resolve_selections(filters, provider=provider)
+            pricing = get_client(provider).get_pricing(resolved["service"]["code"], resolved["country"]["code"])
             self.send_json(
                 200,
                 {
@@ -2720,10 +2880,11 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if method == "GET" and path == "/api/catalog":
             filters = get_filters(query)
-            resolved = resolve_selections(filters)
-            pricing = CLIENT.get_pricing(resolved["service"]["code"], resolved["country"]["code"])
+            resolved = resolve_selections(filters, provider=provider)
+            client = get_client(provider)
+            pricing = client.get_pricing(resolved["service"]["code"], resolved["country"]["code"])
             try:
-                balance = CLIENT.get_balance_cached()
+                balance = client.get_balance_cached()
             except HeroSmsError:
                 balance = None
             self.send_json(
@@ -2735,13 +2896,14 @@ class AppHandler(BaseHTTPRequestHandler):
                     "operators": ["any"],
                     "pricing": pricing,
                     "balance": balance,
+                    "provider": provider,
                     "note": "当前兼容 API 主要返回国家维度价格，运营商选择用于下单通道。",
                 },
             )
             return
 
         if method == "GET" and path == "/api/activations":
-            items = fetch_upstream_activations()
+            items = fetch_upstream_activations(provider)
             items = filter_activations(
                 items,
                 service_code=query.get("serviceCode", ""),
@@ -2749,15 +2911,16 @@ class AppHandler(BaseHTTPRequestHandler):
                 operator=query.get("operator", ""),
                 price=query.get("price", ""),
             )
-            self.send_json(200, {"items": items})
+            self.send_json(200, {"items": items, "provider": provider})
             return
 
         if method == "GET" and path == "/api/current-phone":
-            items = get_current_filtered_activations()
+            items = get_current_filtered_activations(provider=provider)
             self.send_json(
                 200,
                 {
-                    "purchaseSettings": get_purchase_settings(),
+                    "purchaseSettings": get_purchase_settings(provider=provider),
+                    "provider": provider,
                     "item": items[0] if items else None,
                     "items": items,
                 },
@@ -2765,7 +2928,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if method == "GET" and path == "/api/activations/latest":
-            items = fetch_upstream_activations()
+            items = fetch_upstream_activations(provider)
             items = filter_activations(
                 items,
                 service_code=query.get("serviceCode", ""),
@@ -2773,17 +2936,17 @@ class AppHandler(BaseHTTPRequestHandler):
                 operator=query.get("operator", ""),
                 price=query.get("price", ""),
             )
-            self.send_json(200, {"item": items[0] if items else None})
+            self.send_json(200, {"item": items[0] if items else None, "provider": provider})
             return
 
         if method == "POST" and path == "/api/activations/import":
-            items = fetch_upstream_activations()
-            self.send_json(200, {"items": items})
+            items = fetch_upstream_activations(provider)
+            self.send_json(200, {"items": items, "provider": provider})
             return
 
         if method == "POST" and path == "/api/activations":
             body = self.read_json_body()
-            result = purchase_with_fallback(body)
+            result = purchase_with_fallback(body, provider=provider)
             item = dict(result["item"])
             item["rawPurchase"] = result["rawPurchase"]
             self.send_json(201, {"item": item, "filters": result["filters"], "attempts": result["attempts"]})
@@ -2791,25 +2954,27 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if method == "POST" and path == "/api/purchase":
             body = self.read_json_body()
-            result = purchase_with_fallback(body)
+            result = purchase_with_fallback(body, provider=provider)
             self.send_json(
                 201,
                 {
                     "filters": result["filters"],
                     "item": result["item"],
                     "attempts": result["attempts"],
+                    "provider": provider,
                 },
             )
             return
 
         if method == "POST" and path == "/api/activations/sync":
-            self.send_json(200, {"items": fetch_upstream_activations()})
+            self.send_json(200, {"items": fetch_upstream_activations(provider), "provider": provider})
             return
 
         if method == "GET" and path.startswith("/api/activations/") and path.endswith("/code"):
             activation_id = path.split("/")[-2]
-            status = CLIENT.get_status(activation_id)
-            upstream_items = fetch_upstream_activations()
+            client = get_client(provider)
+            status = client.get_status(activation_id)
+            upstream_items = fetch_upstream_activations(provider)
             matched = next((item for item in upstream_items if str(item.get("id")) == str(activation_id)), None)
             if matched is None:
                 matched = normalize_record(
@@ -2840,11 +3005,11 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if method == "GET" and path.startswith("/api/phones/") and path.endswith("/code"):
             phone_number = path.split("/")[-2]
-            matched = find_activation_by_phone(phone_number)
+            matched = find_activation_by_phone(phone_number, provider=provider)
             if not matched:
                 self.send_json(404, {"error": "上游当前活跃号码中找不到该手机号"})
                 return
-            status = CLIENT.get_status(str(matched["id"]))
+            status = get_client(provider).get_status(str(matched["id"]))
             if status.get("code"):
                 matched["lastCode"] = status["code"]
                 matched["codes"] = [status["code"]]
@@ -2852,28 +3017,28 @@ class AppHandler(BaseHTTPRequestHandler):
                 matched["statusLabel"] = status["label"]
                 matched["upstreamStatus"] = status["upstreamStatus"]
                 matched["updatedAt"] = now_iso()
-            self.send_json(200, {"phoneNumber": phone_number, "record": matched, "status": status})
+            self.send_json(200, {"phoneNumber": phone_number, "record": matched, "status": status, "provider": provider})
             return
 
         if method == "GET" and path.startswith("/api/phones/"):
             parts = path.strip("/").split("/")
             if len(parts) == 3 and parts[0] == "api" and parts[1] == "phones":
                 phone_number = parts[2]
-                matched = find_activation_by_phone(phone_number)
+                matched = find_activation_by_phone(phone_number, provider=provider)
                 if not matched:
                     self.send_json(404, {"error": "上游当前活跃号码中找不到该手机号"})
                     return
-                self.send_json(200, {"item": matched})
+                self.send_json(200, {"item": matched, "provider": provider})
                 return
 
         if method == "GET" and path.startswith("/api/activations/"):
             parts = path.strip("/").split("/")
             if len(parts) == 3 and parts[0] == "api" and parts[1] == "activations":
                 activation_id = parts[2]
-                upstream_items = fetch_upstream_activations()
+                upstream_items = fetch_upstream_activations(provider)
                 matched = next((item for item in upstream_items if str(item.get("id")) == str(activation_id)), None)
                 if matched is None:
-                    status = CLIENT.get_status(activation_id)
+                    status = get_client(provider).get_status(activation_id)
                     matched = normalize_record(
                         {
                             "id": activation_id,
@@ -2890,7 +3055,7 @@ class AppHandler(BaseHTTPRequestHandler):
                             "updatedAt": now_iso(),
                         }
                     )
-                self.send_json(200, {"item": matched})
+                self.send_json(200, {"item": matched, "provider": provider})
                 return
 
         if method == "POST" and path.startswith("/api/activations/"):
@@ -2909,7 +3074,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     if action == "cancel" and existing_record:
                         advance_purchase_group_cursor_after_group(existing_record.get("purchaseGroupIndex"))
                     try:
-                        upstream = CLIENT.set_status(activation_id, current["status"])
+                        upstream = get_client(provider).set_status(activation_id, current["status"])
                     except HeroSmsError as error:
                         if action != "cancel" or not is_early_cancel_denied_error(error):
                             raise
@@ -2965,7 +3130,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 if action == "cancel":
                     advance_purchase_group_cursor_after_group(matched.get("purchaseGroupIndex"))
                 try:
-                    upstream = CLIENT.set_status(str(matched["id"]), current["status"])
+                    upstream = get_client(provider).set_status(str(matched["id"]), current["status"])
                 except HeroSmsError as error:
                     if action != "cancel" or not is_early_cancel_denied_error(error):
                         raise

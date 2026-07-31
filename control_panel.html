@@ -184,6 +184,29 @@
       gap: 10px;
     }
     .group-list { display: grid; gap: 12px; }
+    .provider-tabs {
+      display: inline-flex;
+      gap: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #eef1f5;
+    }
+    .provider-tabs button {
+      border: none;
+      background: transparent;
+      padding: 8px 18px;
+      cursor: pointer;
+      font: inherit;
+      color: var(--muted);
+      border-right: 1px solid var(--line);
+    }
+    .provider-tabs button:last-child { border-right: none; }
+    .provider-tabs button.active {
+      background: var(--primary);
+      color: #fff;
+      font-weight: 600;
+    }
     .purchase-group {
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -401,6 +424,7 @@
           <div class="metrics">
             <div class="metric"><b>API</b><span id="apiState">--</span></div>
             <div class="metric"><b>HeroSMS</b><span id="heroState">--</span></div>
+            <div class="metric"><b>SMSBower</b><span id="bowerState">--</span></div>
             <div class="metric"><b>Temp Mail</b><span id="mailState">--</span></div>
             <div class="metric"><b>CPA/OAuth</b><span id="cpaState">--</span></div>
           </div>
@@ -415,7 +439,8 @@
         </section>
         <section>
           <h3>购买设置</h3>
-          <div class="row" style="margin-bottom:10px">
+          <div id="purchaseProviderTabs" class="provider-tabs" role="tablist"></div>
+          <div class="row" style="margin-bottom:10px; margin-top:10px">
             <button id="addPurchaseGroupBtn" class="primary">新增设置组</button>
             <button id="loadPurchaseGroupsBtn">加载设置组</button>
             <button id="savePurchaseGroupsBtn">保存设置组</button>
@@ -427,7 +452,7 @@
         <section>
           <h3>购买设置高级 JSON</h3>
           <div class="field">
-            <label for="settingsText">data/purchase_config.json</label>
+            <label for="settingsText">购买配置文件（当前 <span id="activeProviderLabel">HeroSMS</span>）</label>
             <textarea id="settingsText" spellcheck="false" style="min-height:300px"></textarea>
           </div>
           <div class="row">
@@ -471,6 +496,7 @@
     const appSettingKeys = [
       "HOST", "PORT",
       "HERO_SMS_API_KEY", "HERO_SMS_API_URL",
+      "SMSBOWER_API_KEY", "SMSBOWER_API_URL", "SMS_PROVIDER",
       "TEMP_MAIL_API_URL", "TEMP_MAIL_ADMIN_PASSWORD",
       "CPA_BASE_URL", "CPA_MANAGEMENT_KEY",
       "SIGNUP_PASSWORD", "SIGNUP_NAME", "SIGNUP_AGE",
@@ -485,6 +511,9 @@
       PORT: "服务端口",
       HERO_SMS_API_KEY: "HeroSMS 接口密钥",
       HERO_SMS_API_URL: "HeroSMS 接口地址",
+      SMSBOWER_API_KEY: "SMSBower 接口密钥",
+      SMSBOWER_API_URL: "SMSBower 接口地址",
+      SMS_PROVIDER: "默认短信供应商",
       TEMP_MAIL_API_URL: "临时邮箱接口地址",
       TEMP_MAIL_ADMIN_PASSWORD: "临时邮箱管理员密码",
       CPA_BASE_URL: "CPA / OAuth 服务地址",
@@ -507,9 +536,16 @@
       PURCHASE_CONFIG_FILE: "购买配置文件",
     };
     const secretKeys = new Set([
-      "HERO_SMS_API_KEY", "TEMP_MAIL_ADMIN_PASSWORD",
+      "HERO_SMS_API_KEY", "SMSBOWER_API_KEY",
+      "TEMP_MAIL_ADMIN_PASSWORD",
       "CPA_MANAGEMENT_KEY", "SIGNUP_PASSWORD",
     ]);
+    const PURCHASE_PROVIDERS = [
+      { key: "hero", label: "HeroSMS" },
+      { key: "bower", label: "SMSBower" },
+    ];
+    const providerSettingsByProvider = { hero: null, bower: null };
+    let activePurchaseProvider = "hero";
     let purchaseSettingsState = { serviceName: "OpenAI", serviceCode: "dr", purchaseGroups: [] };
     let countryOptions = [];
     let countrySearchSeq = 0;
@@ -649,22 +685,64 @@
     async function refreshHealth() {
       const health = await requestJSON("GET", "/api/health");
       setState("apiState", health.ok, health.ok ? "运行中" : "异常");
-      setState("heroState", health.configured, health.configured ? "已配置" : "未配置");
+      setState("heroState", health.providers?.hero?.configured, health.providers?.hero?.configured ? "已配置" : "未配置");
+      setState("bowerState", health.providers?.bower?.configured, health.providers?.bower?.configured ? "已配置" : "未配置");
       setState("mailState", health.tempMailConfigured, health.tempMailConfigured ? "已配置" : "未配置");
       setState("cpaState", health.cpaConfigured, health.cpaConfigured ? "已配置" : "未配置");
       return health;
     }
 
-    async function loadSettings() {
-      const payload = await requestJSON("GET", "/api/purchase-settings");
-      purchaseSettingsState = payload.purchaseSettings || payload;
+    function buildProviderParam(provider = activePurchaseProvider) {
+      return `?provider=${encodeURIComponent(provider)}`;
+    }
+
+    async function loadSettingsForProvider(provider = activePurchaseProvider, { silent = false } = {}) {
+      const payload = await requestJSON("GET", `/api/purchase-settings?provider=${encodeURIComponent(provider)}`);
+      const settings = payload.purchaseSettings || payload;
+      providerSettingsByProvider[provider] = settings;
+      purchaseSettingsState = settings;
       $("settingsText").value = JSON.stringify(purchaseSettingsState, null, 2);
       try {
-        await ensureCountriesLoaded(false);
+        await ensureCountriesLoaded(false, provider);
       } catch (error) {
         $("countryCacheState").textContent = `国家缓存未加载: ${error.message || error}`;
       }
       renderPurchaseGroups();
+      if (!silent) log(`已加载 ${providerLabel(provider)} 购买设置`);
+    }
+
+    function providerLabel(provider = activePurchaseProvider) {
+      const entry = PURCHASE_PROVIDERS.find((item) => item.key === provider);
+      return entry ? entry.label : provider;
+    }
+
+    async function switchPurchaseProvider(provider) {
+      if (!provider || !providerSettingsByProvider) return;
+      if (provider === activePurchaseProvider) return;
+      providerSettingsByProvider[activePurchaseProvider] = purchaseSettingsState;
+      activePurchaseProvider = provider;
+      purchaseSettingsState = providerSettingsByProvider[provider] || {
+        serviceName: "OpenAI", serviceCode: "dr", purchaseGroups: [],
+      };
+      $("settingsText").value = JSON.stringify(purchaseSettingsState, null, 2);
+      updatePurchaseProviderTabs();
+      renderPurchaseGroups();
+      try {
+        await ensureCountriesLoaded(false, provider);
+        renderPurchaseGroups();
+      } catch (error) {
+        log(`ERROR: 切换 ${providerLabel(provider)} 国家缓存加载失败: ${error.message || error}`);
+      }
+    }
+
+    function updatePurchaseProviderTabs() {
+      const tabs = $("purchaseProviderTabs");
+      if (!tabs) return;
+      tabs.querySelectorAll("button").forEach((button) => {
+        button.classList.toggle("active", button.dataset.provider === activePurchaseProvider);
+      });
+      const labelNode = $("activeProviderLabel");
+      if (labelNode) labelNode.textContent = providerLabel(activePurchaseProvider);
     }
 
     function normalizePurchaseGroupForUi(group = {}) {
@@ -736,11 +814,12 @@
       return countryOptions;
     }
 
-    async function ensureCountriesLoaded(refresh) {
+    async function ensureCountriesLoaded(refresh, provider = activePurchaseProvider) {
       if (!refresh && countryOptions.length) return;
+      const providerParam = `&provider=${encodeURIComponent(provider)}`;
       const payload = refresh
-        ? await requestJSON("POST", "/api/purchase-catalog/countries/refresh", {})
-        : await requestJSON("GET", "/api/purchase-catalog/countries?limit=500");
+        ? await requestJSON("POST", `/api/purchase-catalog/countries/refresh?provider=${encodeURIComponent(provider)}`, {})
+        : await requestJSON("GET", `/api/purchase-catalog/countries?limit=500${provider ? providerParam : ""}`);
       countryOptions = payload.items || [];
       $("countryCacheState").textContent = `国家缓存: ${payload.total || countryOptions.length} 个，更新时间 ${payload.cachedAt || "--"}`;
     }
@@ -748,7 +827,8 @@
     async function searchCountriesForInput(value) {
       const text = String(value || "").trim();
       if (!text) return [];
-      const payload = await requestJSON("GET", `/api/purchase-catalog/countries?limit=50&query=${encodeURIComponent(text)}`);
+      const providerParam = `&provider=${encodeURIComponent(activePurchaseProvider)}`;
+      const payload = await requestJSON("GET", `/api/purchase-catalog/countries?limit=50&query=${encodeURIComponent(text)}${providerParam}`);
       const remoteItems = payload.items || [];
       mergeCountryOptions(remoteItems);
       const combined = [];
@@ -860,7 +940,8 @@
       operatorSelect.innerHTML = `<option value="any">任意运营商</option>`;
       if (!countryCode) return;
       const serviceCode = encodeURIComponent(purchaseSettingsState.serviceCode || "dr");
-      const url = `/api/purchase-catalog/operators?serviceCode=${serviceCode}&countryCode=${encodeURIComponent(countryCode)}${refresh ? "&refresh=1" : ""}`;
+      const providerParam = `&provider=${encodeURIComponent(activePurchaseProvider)}`;
+      const url = `/api/purchase-catalog/operators?serviceCode=${serviceCode}&countryCode=${encodeURIComponent(countryCode)}${providerParam}${refresh ? "&refresh=1" : ""}`;
       const payload = await requestJSON("GET", url);
       for (const item of payload.items || []) {
         const value = String(item || "").trim();
@@ -1023,7 +1104,18 @@
     async function savePurchaseGroups() {
       syncPurchaseJsonFromDom();
       await saveSettings();
-      await loadSettings();
+      await loadSettingsForProvider(activePurchaseProvider, { silent: true });
+    }
+
+    async function saveSettings() {
+      const payload = JSON.parse($("settingsText").value);
+      payload.provider = activePurchaseProvider;
+      const result = await requestJSON("POST", "/api/purchase-settings", payload);
+      purchaseSettingsState = result.purchaseSettings || result;
+      providerSettingsByProvider[activePurchaseProvider] = purchaseSettingsState;
+      $("settingsText").value = JSON.stringify(purchaseSettingsState, null, 2);
+      renderPurchaseGroups();
+      log(`${providerLabel(activePurchaseProvider)} 购买设置已保存`);
     }
 
     async function loadEmailQueue() {
@@ -1060,15 +1152,6 @@
       const result = await requestJSON("POST", "/api/app-settings", { settings });
       log({ message: "应用配置已保存", configFile: result.configFile });
       await refreshHealth();
-    }
-
-    async function saveSettings() {
-      const payload = JSON.parse($("settingsText").value);
-      const result = await requestJSON("POST", "/api/purchase-settings", payload);
-      purchaseSettingsState = result.purchaseSettings || result;
-      $("settingsText").value = JSON.stringify(purchaseSettingsState, null, 2);
-      renderPurchaseGroups();
-      log("购买设置已保存");
     }
 
     async function generateEmailQueue() {
@@ -1190,7 +1273,12 @@
       await refreshHealth();
       await loadAppSettings();
       await loadEmailQueue();
-      await loadSettings();
+      const providerPayload = await requestJSON("GET", "/api/sms-providers").catch(() => null);
+      if (providerPayload && providerPayload.current) {
+        activePurchaseProvider = providerPayload.current;
+      }
+      updatePurchaseProviderTabs();
+      await loadSettingsForProvider(activePurchaseProvider, { silent: true });
       await refreshUcSignupStatus();
     }
 
@@ -1205,12 +1293,12 @@
       if (event.key === "Enter") login();
     });
     $("refreshAll").onclick = () => run(initData);
-    $("loadSettingsBtn").onclick = () => run(loadSettings);
+    $("loadSettingsBtn").onclick = () => run(() => loadSettingsForProvider(activePurchaseProvider));
     $("saveSettingsBtn").onclick = () => run(saveSettings);
     $("addPurchaseGroupBtn").onclick = () => run(addPurchaseGroup);
-    $("loadPurchaseGroupsBtn").onclick = () => run(loadSettings);
+    $("loadPurchaseGroupsBtn").onclick = () => run(() => loadSettingsForProvider(activePurchaseProvider));
     $("savePurchaseGroupsBtn").onclick = () => run(savePurchaseGroups);
-    $("refreshCountriesBtn").onclick = () => run(async () => { await ensureCountriesLoaded(true); renderPurchaseGroups(); });
+    $("refreshCountriesBtn").onclick = () => run(async () => { await ensureCountriesLoaded(true, activePurchaseProvider); renderPurchaseGroups(); });
     $("generateEmailQueueBtn").onclick = () => run(generateEmailQueue);
     $("saveEmailQueueBtn").onclick = () => run(saveEmailQueue);
     $("loadEmailQueueBtn").onclick = () => run(loadEmailQueue);
@@ -1222,6 +1310,19 @@
     $("ucSignupRefreshBtn").onclick = () => run(refreshUcSignupStatus);
 
     buildSettingsInputs();
+    (function buildProviderTabs() {
+      const tabs = $("purchaseProviderTabs");
+      if (!tabs) return;
+      tabs.innerHTML = "";
+      for (const entry of PURCHASE_PROVIDERS) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.dataset.provider = entry.key;
+        button.textContent = entry.label;
+        button.onclick = () => run(() => switchPurchaseProvider(entry.key));
+        tabs.appendChild(button);
+      }
+    })();
     run(async () => {
       const auth = await requestJSON("GET", "/api/auth/status");
       if (auth.authRequired && !auth.authenticated) {

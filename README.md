@@ -6,20 +6,24 @@ Linux 容器版注册控制面板。
 
 - Web 控制面板：`/ui`
 - 临时邮箱队列生成和验证码读取
-- 购买组可视化配置，保存到本地 `data/purchase_config.json`
+- 购买组可视化配置，支持 HeroSMS 和 SMSBower 双供应商，分别保存到 `data/purchase_config.json` 和 `data/purchase_config_bower.json`
 - Linux 图形浏览器自动注册入口，通过 Xvfb、x11vnc、noVNC 查看
 
 ## 文件结构
 
 ```text
-server.py                  # 本地 API 和 Web 控制面板服务
-control_panel.html         # Linux Web 控制面板
-uc_signup.py               # Linux 浏览器自动注册脚本
-config.example.json        # 应用配置模板
-config.json                # 本地应用配置，不进入 git
-Dockerfile                 # Linux 容器镜像
-docker-compose.yml         # fuckoai 服务
-scripts/start_linux_vnc.sh # Xvfb/VNC/noVNC + server 启动脚本
+server.py                       # 本地 API 和 Web 控制面板服务
+control_panel.html              # Linux Web 控制面板
+uc_signup.py                    # Linux 浏览器自动注册脚本
+config.example.json             # 应用配置模板
+config.json                     # 本地应用配置，不进入 git
+data/purchase_config.json       # HeroSMS 购买配置
+data/purchase_config_bower.json # SMSBower 购买配置
+data/catalog_cache.json         # HeroSMS 国家/运营商缓存
+data/catalog_cache_bower.json   # SMSBower 国家/运营商缓存
+Dockerfile                      # Linux 容器镜像
+docker-compose.yml              # fuckoai 服务
+scripts/start_linux_vnc.sh      # Xvfb/VNC/noVNC + server 启动脚本
 ```
 
 运行数据放在 `data/`，`.env`、`config.json` 和 `data/` 不进入 git，也不进入 Docker build context。
@@ -40,15 +44,28 @@ ADMIN_PASSWORD=你的控制面板管理员密码
 cp config.example.json config.json
 ```
 
-模板已包含 HeroSMS 接口地址、注册资料默认值和浏览器参数；接口密钥、临时邮箱、CPA 等用户配置默认为空。
+模板已包含 HeroSMS / SMSBower 接口地址、注册资料默认值和浏览器参数；接口密钥、临时邮箱、CPA 等用户配置默认为空。
+
+### 短信供应商
+
+支持两套收码供应商，协议兼容（均为 `handler_api.php` 体系），各自独立配置接口地址和密钥：
+
+| 供应商 | 接口地址 | 密钥字段 | 购买配置文件 |
+| --- | --- | --- | --- |
+| HeroSMS | `HERO_SMS_API_URL` | `HERO_SMS_API_KEY` | `data/purchase_config.json` |
+| SMSBower | `SMSBOWER_API_URL` | `SMSBOWER_API_KEY` | `data/purchase_config_bower.json` |
+
+`SMS_PROVIDER` 决定默认使用哪个供应商（`hero` 或 `bower`，默认 `hero`）。可在控制面板“设置”页修改，也可在购买配置页通过 tab 切换查看/编辑对应供应商的购买组。
 
 ## 购买配置
 
-购买参数统一维护在控制面板“设置”页，保存后写入 `data/purchase_config.json`。该文件位于 `data/`，不会进入 git。
+购买参数统一维护在控制面板“设置”页，保存后写入对应供应商的购买配置文件（HeroSMS 写入 `data/purchase_config.json`，SMSBower 写入 `data/purchase_config_bower.json`）。这些文件位于 `data/`，不会进入 git。
+
+购买配置页提供 HeroSMS / SMSBower 两个 tab，切换后只显示并轮询当前选中供应商的购买组和国家/运营商缓存，互不干扰。
 
 默认仓库不提供具体国家、运营商、价格等购买组。首次使用前需要在控制面板新增购买组。
 
-服务端会按已启用购买组顺序尝试买号，失败时自动试下一组。
+服务端会按当前选中供应商已启用购买组顺序尝试买号，失败时自动试下一组；只在当前供应商内轮询，不会跨供应商混用。
 
 ## 启动
 
@@ -106,6 +123,11 @@ http://127.0.0.1:3030/api
 - `POST /api/purchase`
 - `GET /api/purchase-settings`
 - `POST /api/purchase-settings`
+- `GET /api/sms-providers`
+- `POST /api/sms-providers/current`
+- `GET /api/purchase-catalog/countries`
+- `POST /api/purchase-catalog/countries/refresh`
+- `GET /api/purchase-catalog/operators`
 - `GET /api/email-queue`
 - `POST /api/email-queue`
 - `POST /api/email-queue/generate`
@@ -113,6 +135,8 @@ http://127.0.0.1:3030/api
 - `POST /api/uc-signup/start`
 - `POST /api/uc-signup/stop`
 - `GET /api/uc-signup/logs`
+
+以上涉及号码/购买的接口均支持 `?provider=hero|bower` query 参数指定供应商，省略时使用当前默认（`SMS_PROVIDER`）。`POST /api/purchase-settings` 支持在 body 中传 `provider` 字段指定要保存的供应商配置。
 
 ## 致谢
 
