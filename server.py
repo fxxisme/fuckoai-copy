@@ -2402,48 +2402,64 @@ def build_purchase_item(
     return normalize_record(item)
 
 
+def is_smsbower_no_number_error(error: Exception | str) -> bool:
+    text = str(error or "").upper()
+    return "NO_NUMBERS" in text or "NO_NUMBER" in text
+
+
 def purchase_with_fallback(source: dict[str, Any] | None = None, *, provider: str | None = None) -> dict[str, Any]:
     provider = normalize_sms_provider(provider)
     attempts_summary = []
     last_error: HeroSmsError | None = None
-    for index, attempt in enumerate(build_purchase_attempts(source, provider=provider), start=1):
-        filters = attempt["filters"]
-        label = str(attempt.get("label") or build_purchase_group_label(filters, index=index))
-        try:
-            purchase, resolved = execute_purchase(filters, provider=provider)
-            return {
-                "provider": provider,
-                "filters": filters,
-                "item": build_purchase_item(
-                    purchase,
-                    resolved,
-                    purchase_group_index=int(attempt["groupIndex"]) if attempt.get("groupIndex") is not None else None,
-                ),
-                "rawPurchase": purchase["raw"],
-                "attempts": attempts_summary
-                + [
+    retry_delays = (3, 6) if provider == "bower" else ()
+    for round_index in range(len(retry_delays) + 1):
+        round_errors: list[HeroSmsError] = []
+        for index, attempt in enumerate(build_purchase_attempts(source, provider=provider), start=1):
+            filters = attempt["filters"]
+            label = str(attempt.get("label") or build_purchase_group_label(filters, index=index))
+            try:
+                purchase, resolved = execute_purchase(filters, provider=provider)
+                return {
+                    "provider": provider,
+                    "filters": filters,
+                    "item": build_purchase_item(
+                        purchase,
+                        resolved,
+                        purchase_group_index=int(attempt["groupIndex"]) if attempt.get("groupIndex") is not None else None,
+                    ),
+                    "rawPurchase": purchase["raw"],
+                    "attempts": attempts_summary
+                    + [
+                        {
+                            "index": index,
+                            "round": round_index + 1,
+                            "label": label,
+                            "filters": filters,
+                            "success": True,
+                            "groupIndex": attempt.get("groupIndex"),
+                        }
+                    ],
+                }
+            except HeroSmsError as error:
+                last_error = error
+                round_errors.append(error)
+                attempts_summary.append(
                     {
                         "index": index,
+                        "round": round_index + 1,
                         "label": label,
                         "filters": filters,
-                        "success": True,
+                        "success": False,
                         "groupIndex": attempt.get("groupIndex"),
+                        "error": str(error),
                     }
-                ],
-            }
-        except HeroSmsError as error:
-            last_error = error
-            attempts_summary.append(
-                {
-                    "index": index,
-                    "label": label,
-                    "filters": filters,
-                    "success": False,
-                    "groupIndex": attempt.get("groupIndex"),
-                    "error": str(error),
-                }
-            )
-            continue
+                )
+
+        if round_index >= len(retry_delays) or not round_errors or not all(is_smsbower_no_number_error(error) for error in round_errors):
+            break
+        delay = retry_delays[round_index]
+        print(f"[SMSBower] 本轮无可用号码，{delay}s 后重试 ({round_index + 2}/{len(retry_delays) + 1})", flush=True)
+        time.sleep(delay)
 
     detail = "；".join(f"{item['index']}. {item['label']}: {item['error']}" for item in attempts_summary) or "没有可执行的购买组"
     raise PurchaseError(f"所有购买配置都失败: {detail}", attempts_summary) from last_error
