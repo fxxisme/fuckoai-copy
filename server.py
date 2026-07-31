@@ -3153,7 +3153,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[0] == "api" and parts[1] == "phones":
                 phone_number = parts[2]
                 action = parts[3]
-                matched = find_activation_by_phone(phone_number)
+                matched = find_activation_by_phone(phone_number, provider=provider)
                 if not matched:
                     self.send_json(404, {"error": "上游当前活跃号码中找不到该手机号"})
                     return

@@ -285,13 +285,14 @@ class SignupBot:
         raise StepError("找不到任何输入框")
 
     # ── SMS/邮箱轮询 ─────────────────────────────────────
-    def poll_sms(self, phone):
+    def poll_sms(self, phone, provider=""):
         deadline = time.time() + SMS_TIMEOUT_SECONDS
         attempt = 0
+        provider_query = f"?provider={provider}" if provider else ""
         while time.time() < deadline:
             attempt += 1
             try:
-                r = api("GET", f"/api/phones/{phone}/code")
+                r = api("GET", f"/api/phones/{phone}/code{provider_query}")
                 code = r.get("status", {}).get("code")
                 if code: return str(code)
             except: pass
@@ -466,11 +467,12 @@ class SignupBot:
         self.dump_diagnostics("fill_birth_year_missing_age")
         raise StepError("找不到年龄/出生年份输入框")
 
-    def cancel_phone(self, phone, reason=""):
+    def cancel_phone(self, phone, reason="", provider=""):
         if not phone:
             return False
         try:
-            result = api("POST", f"/api/phones/{phone}/cancel")
+            provider_query = f"?provider={provider}" if provider else ""
+            result = api("POST", f"/api/phones/{phone}/cancel{provider_query}")
             warning = str(result.get("warning") or "").strip() if isinstance(result, dict) else ""
             if warning:
                 log(f"  手机号 {phone} 取消已提交但上游暂不允许立即取消: {warning}", "warn")
@@ -528,7 +530,7 @@ class SignupBot:
         self.wait_url_contains("contact-verification")
         log(f"→ {self.d.title}")
 
-        code = self.poll_sms(phone)
+        code = self.poll_sms(phone, self.sms_provider)
         if not code:
             raise PhoneRetry(f"短信验证码 {SMS_TIMEOUT_SECONDS}s 超时", cancel_phone=True)
         log(f"  SMS: {code}")
@@ -578,6 +580,7 @@ class SignupBot:
         log("=" * 55)
 
         phone = full_phone = ""
+        self.sms_provider = ""
         completed_success = False
         balance_before = None
         try:
@@ -600,7 +603,9 @@ class SignupBot:
                 if PHONE_RETRY_LIMIT > 0 and phone_attempt > PHONE_RETRY_LIMIT:
                     raise FatalError(f"同一邮箱换号重试已达上限: {last_phone_error}")
 
-                phone = api("POST", "/api/purchase", {})["item"]["phoneNumber"]
+                purchase = api("POST", "/api/purchase", {})
+                phone = purchase["item"]["phoneNumber"]
+                self.sms_provider = str(purchase.get("provider") or "").strip()
                 log(f"  手机号尝试 {attempt_label}")
                 try:
                     full_phone = self.register_with_phone(phone)
@@ -610,11 +615,12 @@ class SignupBot:
                     log(f"  当前手机号不可用: {e}", "warn")
                     if e.cancel_phone:
                         log("  准备取消旧手机号，随后购买新手机号并从注册页重新开始", "warn")
-                        self.cancel_phone(phone, str(e))
+                        self.cancel_phone(phone, str(e), self.sms_provider)
                     else:
                         log(f"  未使用短信验证码，不取消手机号 {phone}", "warn")
                     phone = ""
                     full_phone = ""
+                    self.sms_provider = ""
                     self.close_browser()
                     log("  从头开始注册，邮箱按需延迟创建", "warn")
                     continue
@@ -714,7 +720,9 @@ class SignupBot:
             log(f"  凭证: {json.dumps(files, ensure_ascii=False)[:500]}")
 
             # 清理
-            try: api("POST", f"/api/phones/{phone}/finish")
+            try:
+                provider_query = f"?provider={self.sms_provider}" if self.sms_provider else ""
+                api("POST", f"/api/phones/{phone}/finish{provider_query}")
             except: pass
 
             log("=" * 55)
@@ -739,7 +747,7 @@ class SignupBot:
             log(f"❌ {e}", "error")
         finally:
             if phone and not completed_success:
-                self.cancel_phone(phone, "任务未完成")
+                self.cancel_phone(phone, "任务未完成", self.sms_provider)
             if self.d:
                 try: self.d.save_screenshot("/tmp/uc_error.png")
                 except: pass
