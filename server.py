@@ -1022,14 +1022,44 @@ class HeroSmsClient:
 class SmsBowerClient(HeroSmsClient):
     """SMSBower 接口客户端。
 
-    SMSBower 的 handler_api 与 hero-sms 协议兼容（getBalance / getNumber /
-    getNumberV2 / getStatus / setStatus / getPrices / getServicesList /
-    getCountries 等动作完全一致），故直接继承 HeroSmsClient。
-    若后续需要调用 SMSBower 特有接口（getPricesV2/V3、
-    getTopCountriesByService、getActualWalletAddress 等），在此扩展。
+    SMSBower 大部分 handler_api 动作与 HeroSMS 协议兼容。购号使用
+    getNumberV2；精确价格通过相同的 minPrice / maxPrice 限定。
     """
 
-    pass
+    def buy_activation(self, *, service_code: str, country_code: str, operator: str, max_price: str | None) -> dict[str, Any]:
+        payload = self.request(
+            "getNumberV2",
+            service=service_code,
+            country=country_code,
+            operator=operator or "any",
+            maxPrice=max_price or "",
+        )
+        return self._parse_purchase_payload(payload, service_code, country_code, operator)
+
+    def buy_activation_fixed_price(
+        self,
+        *,
+        service_code: str,
+        country_code: str,
+        operator: str,
+        exact_price: str,
+    ) -> dict[str, Any]:
+        payload = self.request(
+            "getNumberV2",
+            service=service_code,
+            country=country_code,
+            operator=operator or "any",
+            minPrice=exact_price,
+            maxPrice=exact_price,
+        )
+        return self._parse_purchase_payload(payload, service_code, country_code, operator)
+
+    def set_status(self, activation_id: str, status: int) -> dict[str, Any]:
+        payload = self.request("setStatus", id=activation_id, status=status)
+        result = str(payload).strip()
+        if status == 8 and result != "ACCESS_CANCEL":
+            raise HeroSmsError(result or "SMSBower 取消号码失败")
+        return {"raw": payload, "result": result}
 
 
 class TempMailClient:
@@ -1843,8 +1873,7 @@ def advance_purchase_group_cursor_after_group(group_index: Any) -> None:
 
 
 def is_early_cancel_denied_error(error: Exception | str) -> bool:
-    text = str(error or "")
-    return "EARLY_CANCEL_DENIED" in text and "minActivationTime" in text
+    return "EARLY_CANCEL_DENIED" in str(error or "")
 
 
 def get_purchase_settings(
@@ -3081,8 +3110,6 @@ class AppHandler(BaseHTTPRequestHandler):
                     }
                     current = action_map[action]
                     existing_record = STORE.get(activation_id)
-                    if action == "cancel" and existing_record:
-                        advance_purchase_group_cursor_after_group(existing_record.get("purchaseGroupIndex"))
                     try:
                         upstream = get_client(provider).set_status(activation_id, current["status"])
                     except HeroSmsError as error:
@@ -3107,6 +3134,8 @@ class AppHandler(BaseHTTPRequestHandler):
                             },
                         )
                         return
+                    if action == "cancel" and existing_record:
+                        advance_purchase_group_cursor_after_group(existing_record.get("purchaseGroupIndex"))
                     item = normalize_record(
                         {
                             "id": activation_id,
@@ -3137,8 +3166,6 @@ class AppHandler(BaseHTTPRequestHandler):
                     "ready": {"status": 1, "localStatus": "waiting_for_code", "label": "等待验证码"},
                 }
                 current = action_map[action]
-                if action == "cancel":
-                    advance_purchase_group_cursor_after_group(matched.get("purchaseGroupIndex"))
                 try:
                     upstream = get_client(provider).set_status(str(matched["id"]), current["status"])
                 except HeroSmsError as error:
@@ -3163,6 +3190,8 @@ class AppHandler(BaseHTTPRequestHandler):
                         },
                     )
                     return
+                if action == "cancel":
+                    advance_purchase_group_cursor_after_group(matched.get("purchaseGroupIndex"))
                 item = normalize_record(
                     {
                         **matched,
