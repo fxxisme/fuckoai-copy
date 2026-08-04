@@ -340,8 +340,8 @@ ENV_PATH = ROOT / ".env"
 
 
 STATUS_LABELS = {
-    "STATUS_WAIT_CODE": "等待验证码",
-    "STATUS_WAIT_RETRY": "等待重发",
+    "STATUS_WAIT_CODE": "等待短信",
+    "STATUS_WAIT_RETRY": "等待下一条短信",
     "STATUS_WAIT_RESEND": "等待再次发送",
     "STATUS_WAIT_ACTIVATION": "等待激活",
     "STATUS_WAIT_GET": "号码已下发",
