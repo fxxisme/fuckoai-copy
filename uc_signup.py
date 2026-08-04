@@ -500,10 +500,8 @@ class SignupBot:
             cancel_phone=False,
         )
 
-    def register_with_phone(self, phone):
-        full_phone = "+" + re.sub(r'\D', '', phone)
-        log(f"📱 {phone}")
-
+    def prepare_phone_signup_page(self):
+        """打开注册页并停在手机号输入框，供购号成功后立即提交。"""
         self.launch()
 
         self.d.get("https://chatgpt.com/auth/login?intent=signup")
@@ -515,6 +513,13 @@ class SignupBot:
         self._step("展开手机表单", lambda: (
             self.click("Continue with phone"), time.sleep(4)
         ))
+
+    def register_with_phone(self, phone):
+        full_phone = "+" + re.sub(r'\D', '', phone)
+        log(f"📱 {phone}")
+
+        if not self.d:
+            self.prepare_phone_signup_page()
 
         self._step("填手机号", lambda: (
             self.fill("input[name=phoneNumberInput]", full_phone),
@@ -602,6 +607,9 @@ class SignupBot:
                     attempt_label = f"{phone_attempt}/不限"
                 if PHONE_RETRY_LIMIT > 0 and phone_attempt > PHONE_RETRY_LIMIT:
                     raise FatalError(f"同一邮箱换号重试已达上限: {last_phone_error}")
+
+                if not self.d:
+                    self.prepare_phone_signup_page()
 
                 purchase = api("POST", "/api/purchase", {})
                 phone = purchase["item"]["phoneNumber"]

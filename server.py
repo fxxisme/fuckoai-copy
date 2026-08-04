@@ -2408,12 +2408,11 @@ def purchase_with_fallback(source: dict[str, Any] | None = None, *, provider: st
     provider = normalize_sms_provider(provider)
     attempts_summary = []
     last_error: HeroSmsError | None = None
-    retry_delays = (3, 6) if provider == "bower" else ()
-    for round_index in range(len(retry_delays) + 1):
-        round_errors: list[HeroSmsError] = []
-        for index, attempt in enumerate(build_purchase_attempts(source, provider=provider), start=1):
-            filters = attempt["filters"]
-            label = str(attempt.get("label") or build_purchase_group_label(filters, index=index))
+    for index, attempt in enumerate(build_purchase_attempts(source, provider=provider), start=1):
+        filters = attempt["filters"]
+        label = str(attempt.get("label") or build_purchase_group_label(filters, index=index))
+        max_attempts = 5 if provider == "bower" else 1
+        for retry_index in range(max_attempts):
             try:
                 purchase, resolved = execute_purchase(filters, provider=provider)
                 return {
@@ -2429,7 +2428,7 @@ def purchase_with_fallback(source: dict[str, Any] | None = None, *, provider: st
                     + [
                         {
                             "index": index,
-                            "round": round_index + 1,
+                            "round": retry_index + 1,
                             "label": label,
                             "filters": filters,
                             "success": True,
@@ -2439,11 +2438,10 @@ def purchase_with_fallback(source: dict[str, Any] | None = None, *, provider: st
                 }
             except HeroSmsError as error:
                 last_error = error
-                round_errors.append(error)
                 attempts_summary.append(
                     {
                         "index": index,
-                        "round": round_index + 1,
+                        "round": retry_index + 1,
                         "label": label,
                         "filters": filters,
                         "success": False,
@@ -2451,12 +2449,17 @@ def purchase_with_fallback(source: dict[str, Any] | None = None, *, provider: st
                         "error": str(error),
                     }
                 )
-
-        if round_index >= len(retry_delays) or not round_errors or not all(is_smsbower_no_number_error(error) for error in round_errors):
-            break
-        delay = retry_delays[round_index]
-        print(f"[SMSBower] 本轮无可用号码，{delay}s 后重试 ({round_index + 2}/{len(retry_delays) + 1})", flush=True)
-        time.sleep(delay)
+                if (
+                    provider != "bower"
+                    or not is_smsbower_no_number_error(error)
+                    or retry_index >= max_attempts - 1
+                ):
+                    break
+                print(
+                    f"[SMSBower] {label} 暂无号码，1.5s 后重试 ({retry_index + 2}/{max_attempts})",
+                    flush=True,
+                )
+                time.sleep(1.5)
 
     detail = "；".join(f"{item['index']}. {item['label']}: {item['error']}" for item in attempts_summary) or "没有可执行的购买组"
     raise PurchaseError(f"所有购买配置都失败: {detail}", attempts_summary) from last_error
