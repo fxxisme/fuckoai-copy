@@ -350,6 +350,20 @@ class SignupBot:
             try: self.d.quit()
             except: pass
             self.d = None
+        self.reap_exited_children()
+
+    @staticmethod
+    def reap_exited_children():
+        """回收 WebDriver 退出后仍残留的 Chromium/Crashpad 子进程。"""
+        while True:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return
+            except OSError:
+                return
+            if pid == 0:
+                return
 
     def dump_diagnostics(self, tag=""):
         """把当前页面快照存到 DIAG_DIR，便于事后排查找不到控件等问题。

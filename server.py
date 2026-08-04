@@ -1858,6 +1858,7 @@ class UcSignupManager:
                     self._handle_process_line(line)
 
         return_code = process.wait()
+        self._reap_exited_children()
         with self._lock:
             if self._process is process:
                 self._process = None
@@ -1867,6 +1868,19 @@ class UcSignupManager:
         if return_code == 0:
             return ("success", None, return_code)
         return ("fail", f"uc_signup.py 退出码 {return_code}", return_code)
+
+    @staticmethod
+    def _reap_exited_children() -> None:
+        """Reap Chromium descendants orphaned after a completed UC task."""
+        while True:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return
+            except OSError:
+                return
+            if pid == 0:
+                return
 
     def _handle_process_line(self, line: str) -> None:
         level = "error" if any(token in line for token in ("❌", "💀")) else "warn" if "⚠" in line else "info"
@@ -1915,23 +1929,26 @@ class UcSignupManager:
             pass
 
     def _terminate_process(self, process: subprocess.Popen | None) -> None:
-        if not process or process.poll() is not None:
-            return
         try:
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        except Exception:
-            try:
-                process.terminate()
-            except Exception:
+            if not process or process.poll() is not None:
                 return
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
             try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
             except Exception:
-                process.kill()
-            process.wait(timeout=5)
+                try:
+                    process.terminate()
+                except Exception:
+                    return
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except Exception:
+                    process.kill()
+                process.wait(timeout=5)
+        finally:
+            self._reap_exited_children()
 
 
 UC_SIGNUP_MANAGER = UcSignupManager()
