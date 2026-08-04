@@ -1019,12 +1019,98 @@ class HeroSmsClient:
         }
 
 
-class SmsBowerClient(HeroSmsClient):
+class SmsBowerClient:
     """SMSBower 接口客户端。
 
-    购号使用 SMSBower 的 ``getNumber`` 动作；精确价格使用 ``fixPrice``，
-    不支持 HeroSMS 的 operator 参数。
+    独立实现 SMSBower handler_api 协议，不复用 HeroSMS 的请求、购号、
+    查码或取消逻辑。
     """
+
+    def __init__(self, api_key: str, api_url: str, timeout_ms: int) -> None:
+        self.api_key = api_key
+        self.api_url = api_url
+        self.timeout_seconds = timeout_ms / 1000
+        self.cache_ttl_seconds = 600
+        self._cache: dict[str, dict[str, Any]] = {}
+
+    def _get_cached(self, key: str) -> Any | None:
+        cached = self._cache.get(key)
+        if not cached or datetime.now().timestamp() >= cached.get("expiresAt", 0):
+            self._cache.pop(key, None)
+            return None
+        return cached.get("value")
+
+    def _set_cached(self, key: str, value: Any) -> Any:
+        self._cache[key] = {"value": value, "expiresAt": datetime.now().timestamp() + self.cache_ttl_seconds}
+        return value
+
+    def request(self, action: str, **params: Any) -> Any:
+        if not self.api_key:
+            raise HeroSmsError("未配置 SMSBOWER_API_KEY")
+        query = {"api_key": self.api_key, "action": action}
+        query.update({key: str(value) for key, value in params.items() if value not in (None, "")})
+        request = Request(
+            f"{self.api_url}?{urlencode(query)}",
+            headers={"Accept": "application/json,text/plain;q=0.9,*/*;q=0.8", "User-Agent": "python-smsbower-client/1.0"},
+        )
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                text = response.read().decode("utf-8", errors="replace").strip()
+        except HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace").strip()
+            raise HeroSmsError(f"SMSBower 上游请求失败: HTTP {error.code} {body}".strip())
+        except URLError as error:
+            raise HeroSmsError(f"SMSBower 上游连接失败: {error.reason}")
+        if text.startswith(("BAD_", "ERROR_", "NO_", "WRONG_", "SQL_")):
+            raise HeroSmsError(text)
+        return json.loads(text) if text.startswith(("{", "[")) else text
+
+    def get_balance(self) -> Any:
+        result = self.request("getBalance")
+        if isinstance(result, str) and result.startswith("ACCESS_BALANCE:"):
+            try:
+                return float(result.split(":", 1)[1])
+            except (ValueError, IndexError):
+                pass
+        return result
+
+    def get_balance_cached(self, force: bool = False) -> Any:
+        cached = None if force else self._get_cached("balance")
+        return cached if cached is not None else self._set_cached("balance", self.get_balance())
+
+    def get_services(self) -> list[dict[str, str]]:
+        cached = self._get_cached("services")
+        return cached if cached is not None else self._set_cached("services", HeroSmsClient._normalize_services(self.request("getServicesList")))
+
+    def get_countries(self, force: bool = False) -> list[dict[str, Any]]:
+        cached = None if force else self._get_cached("countries")
+        return cached if cached is not None else self._set_cached("countries", HeroSmsClient._normalize_countries(self.request("getCountries")))
+
+    def resolve_service(self, name: str, aliases: list[str]) -> tuple[dict[str, str], list[dict[str, str]]]:
+        services = self.get_services()
+        match = HeroSmsClient._pick_by_name(services, name, aliases, ("name", "code"))
+        if not match:
+            raise HeroSmsError(f"找不到服务: {name}")
+        return match, services
+
+    def resolve_country(self, name: str, aliases: list[str]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        countries = self.get_countries()
+        match = HeroSmsClient._pick_by_name(countries, name, aliases, ("name", "localName", "code"))
+        if not match:
+            raise HeroSmsError(f"找不到国家/地区: {name}")
+        return match, countries
+
+    def get_pricing(self, service_code: str, country_code: str) -> dict[str, Any]:
+        cache_key = f"pricing:{service_code}:{country_code}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+        payload = self.request("getPrices", service=service_code, country=country_code)
+        result = HeroSmsClient._extract_price_info(payload, country_code, service_code) or {"price": None, "count": None, "raw": payload}
+        return self._set_cached(cache_key, result)
+
+    def get_operators(self, service_code: str, country_code: str, force: bool = False) -> list[str]:
+        return ["any"]
 
     def buy_activation(self, *, service_code: str, country_code: str, operator: str, max_price: str | None) -> dict[str, Any]:
         payload = self.request(
@@ -1050,6 +1136,46 @@ class SmsBowerClient(HeroSmsClient):
             fixPrice=exact_price,
         )
         return self._parse_purchase_payload(payload, service_code, country_code, operator)
+
+    def get_status(self, activation_id: str) -> dict[str, Any]:
+        text = str(self.request("getStatus", id=activation_id)).strip()
+        status, separator, value = text.partition(":")
+        return {
+            "raw": text,
+            "upstreamStatus": status or "UNKNOWN",
+            "localStatus": NORMALIZED_STATES.get(status, "unknown"),
+            "label": STATUS_LABELS.get(status, status or "UNKNOWN"),
+            "code": value if separator and value else None,
+        }
+
+    def get_active_activations(self) -> list[dict[str, Any]]:
+        payload = self.request("getActiveActivations")
+        if isinstance(payload, dict):
+            active = payload.get("activeActivations")
+            if isinstance(active, dict) and isinstance(active.get("rows"), list):
+                return active["rows"]
+            if isinstance(payload.get("data"), list):
+                return payload["data"]
+        return []
+
+    @staticmethod
+    def _parse_purchase_payload(payload: Any, service_code: str, country_code: str, operator: str) -> dict[str, Any]:
+        text = str(payload).strip()
+        if not text.startswith("ACCESS_NUMBER:"):
+            raise HeroSmsError(f"无法解析 SMSBower 购号响应: {text}")
+        _, activation_id, phone_number = text.split(":", 2)
+        if not activation_id or not phone_number:
+            raise HeroSmsError(f"无法解析 SMSBower 购号响应: {text}")
+        return {
+            "id": activation_id,
+            "phoneNumber": phone_number,
+            "activationCost": None,
+            "countryCode": country_code,
+            "serviceCode": service_code,
+            "operator": operator or "any",
+            "canGetAnotherSms": False,
+            "raw": text,
+        }
 
     def set_status(self, activation_id: str, status: int) -> dict[str, Any]:
         payload = self.request("setStatus", id=activation_id, status=status)
@@ -1235,14 +1361,14 @@ class CpaClient:
         return self._request("GET", "/v0/management/auth-files")
 
 
-CLIENTS: dict[str, HeroSmsClient] = {}
+CLIENTS: dict[str, HeroSmsClient | SmsBowerClient] = {}
 TEMP_MAIL = TempMailClient(CONFIG.temp_mail_api_url, CONFIG.temp_mail_admin_password, CONFIG.timeout_ms)
 CPA = CpaClient(CONFIG.cpa_base_url, CONFIG.cpa_management_key, CONFIG.timeout_ms)
 PURCHASE_GROUP_CURSOR_LOCK = threading.Lock()
 PURCHASE_GROUP_NEXT_INDEX = 0
 
 
-def build_sms_client(provider: str) -> HeroSmsClient:
+def build_sms_client(provider: str) -> HeroSmsClient | SmsBowerClient:
     key = normalize_sms_provider(provider)
     if key == "bower":
         return SmsBowerClient(CONFIG.bower_api_key, CONFIG.bower_api_url, CONFIG.timeout_ms)
@@ -1254,7 +1380,7 @@ def reload_sms_clients() -> None:
     CLIENTS = {provider: build_sms_client(provider) for provider in SMS_PROVIDERS}
 
 
-def get_client(provider: str | None = None) -> HeroSmsClient:
+def get_client(provider: str | None = None) -> HeroSmsClient | SmsBowerClient:
     key = normalize_sms_provider(provider or CONFIG.sms_provider)
     if key not in CLIENTS:
         CLIENTS[key] = build_sms_client(key)
@@ -1267,7 +1393,7 @@ def current_provider() -> str:
 
 # 向后兼容：CLIENT 指向当前选中 provider 的客户端
 class _CurrentClientProxy:
-    def _target(self) -> HeroSmsClient:
+    def _target(self) -> HeroSmsClient | SmsBowerClient:
         return get_client(current_provider())
 
     def __getattr__(self, item):
@@ -2145,10 +2271,10 @@ def resolve_selections(filters: dict[str, str], *, provider: str | None = None) 
 
     services = client.get_services()
     countries = client.get_countries()
-    service = find_by_code(services, service_code) or client._pick_by_name(
+    service = find_by_code(services, service_code) or HeroSmsClient._pick_by_name(
         services, filters["serviceName"], CONFIG.default_service_aliases, ("name", "code")
     )
-    country = find_by_code(countries, country_code) or client._pick_by_name(
+    country = find_by_code(countries, country_code) or HeroSmsClient._pick_by_name(
         countries, filters["countryName"], CONFIG.default_country_aliases, ("name", "localName", "code")
     )
     if not service:
@@ -3029,8 +3155,7 @@ class AppHandler(BaseHTTPRequestHandler):
             activation_id = path.split("/")[-2]
             client = get_client(provider)
             status = client.get_status(activation_id)
-            upstream_items = fetch_upstream_activations(provider)
-            matched = next((item for item in upstream_items if str(item.get("id")) == str(activation_id)), None)
+            matched = STORE.get(activation_id)
             if matched is None:
                 matched = normalize_record(
                     {

@@ -285,16 +285,18 @@ class SignupBot:
         raise StepError("找不到任何输入框")
 
     # ── SMS/邮箱轮询 ─────────────────────────────────────
-    def poll_sms(self, phone, provider=""):
+    def poll_sms(self, activation_id, provider=""):
         deadline = time.time() + SMS_TIMEOUT_SECONDS
         attempt = 0
         provider_query = f"?provider={provider}" if provider else ""
         while time.time() < deadline:
             attempt += 1
             try:
-                r = api("GET", f"/api/phones/{phone}/code{provider_query}")
+                r = api("GET", f"/api/activations/{activation_id}/code{provider_query}")
                 code = r.get("status", {}).get("code")
-                if code: return str(code)
+                status = r.get("status", {}).get("upstreamStatus")
+                if status == "STATUS_OK" and code:
+                    return str(code)
             except: pass
             remaining = max(0, int(deadline - time.time()))
             if attempt == 1 or attempt % 3 == 0:
@@ -467,20 +469,20 @@ class SignupBot:
         self.dump_diagnostics("fill_birth_year_missing_age")
         raise StepError("找不到年龄/出生年份输入框")
 
-    def cancel_phone(self, phone, reason="", provider=""):
-        if not phone:
+    def cancel_activation(self, activation_id, reason="", provider=""):
+        if not activation_id:
             return False
         try:
             provider_query = f"?provider={provider}" if provider else ""
-            result = api("POST", f"/api/phones/{phone}/cancel{provider_query}")
+            result = api("POST", f"/api/activations/{activation_id}/cancel{provider_query}")
             warning = str(result.get("warning") or "").strip() if isinstance(result, dict) else ""
             if warning:
-                log(f"  手机号 {phone} 取消已提交但上游暂不允许立即取消: {warning}", "warn")
+                log(f"  激活 {activation_id} 取消已提交但上游暂不允许立即取消: {warning}", "warn")
             else:
-                log(f"  已取消手机号 {phone}{'：' + reason if reason else ''}", "warn")
+                log(f"  已取消激活 {activation_id}{'：' + reason if reason else ''}", "warn")
             return True
         except Exception as e:
-            log(f"  取消手机号失败 {phone}: {e}", "warn")
+            log(f"  取消激活失败 {activation_id}: {e}", "warn")
             return False
 
     def wait_password_input_after_phone(self):
@@ -514,7 +516,7 @@ class SignupBot:
             self.click("Continue with phone"), time.sleep(4)
         ))
 
-    def register_with_phone(self, phone):
+    def register_with_phone(self, phone, activation_id):
         full_phone = "+" + re.sub(r'\D', '', phone)
         log(f"📱 {phone}")
 
@@ -535,7 +537,7 @@ class SignupBot:
         self.wait_url_contains("contact-verification")
         log(f"→ {self.d.title}")
 
-        code = self.poll_sms(phone, self.sms_provider)
+        code = self.poll_sms(activation_id, self.sms_provider)
         if not code:
             raise PhoneRetry(f"短信验证码 {SMS_TIMEOUT_SECONDS}s 超时", cancel_phone=True)
         log(f"  SMS: {code}")
@@ -584,7 +586,7 @@ class SignupBot:
         log("ChatGPT 注册 → OAuth → CPA 回调")
         log("=" * 55)
 
-        phone = full_phone = ""
+        phone = full_phone = activation_id = ""
         self.sms_provider = ""
         completed_success = False
         balance_before = None
@@ -613,21 +615,23 @@ class SignupBot:
 
                 purchase = api("POST", "/api/purchase", {})
                 phone = purchase["item"]["phoneNumber"]
+                activation_id = str(purchase["item"]["id"])
                 self.sms_provider = str(purchase.get("provider") or "").strip()
                 log(f"  手机号尝试 {attempt_label}")
                 try:
-                    full_phone = self.register_with_phone(phone)
+                    full_phone = self.register_with_phone(phone, activation_id)
                     break
                 except PhoneRetry as e:
                     last_phone_error = str(e)
                     log(f"  当前手机号不可用: {e}", "warn")
                     if e.cancel_phone:
                         log("  准备取消旧手机号，随后购买新手机号并从注册页重新开始", "warn")
-                        self.cancel_phone(phone, str(e), self.sms_provider)
+                        self.cancel_activation(activation_id, str(e), self.sms_provider)
                     else:
                         log(f"  未使用短信验证码，不取消手机号 {phone}", "warn")
                     phone = ""
                     full_phone = ""
+                    activation_id = ""
                     self.sms_provider = ""
                     self.close_browser()
                     log("  从头开始注册，邮箱按需延迟创建", "warn")
@@ -730,7 +734,7 @@ class SignupBot:
             # 清理
             try:
                 provider_query = f"?provider={self.sms_provider}" if self.sms_provider else ""
-                api("POST", f"/api/phones/{phone}/finish{provider_query}")
+                api("POST", f"/api/activations/{activation_id}/finish{provider_query}")
             except: pass
 
             log("=" * 55)
@@ -754,8 +758,8 @@ class SignupBot:
         except Exception as e:
             log(f"❌ {e}", "error")
         finally:
-            if phone and not completed_success:
-                self.cancel_phone(phone, "任务未完成", self.sms_provider)
+            if activation_id and not completed_success:
+                self.cancel_activation(activation_id, "任务未完成", self.sms_provider)
             if self.d:
                 try: self.d.save_screenshot("/tmp/uc_error.png")
                 except: pass
