@@ -1022,8 +1022,8 @@ class HeroSmsClient:
 class SmsBowerClient(HeroSmsClient):
     """SMSBower 接口客户端。
 
-    购号使用 SMSBower 的 ``getNumber`` 动作。该接口以 minPrice / maxPrice
-    限制价格，不支持 HeroSMS 的 operator 参数。
+    购号使用 SMSBower 的 ``getNumber`` 动作；精确价格使用 ``fixPrice``，
+    不支持 HeroSMS 的 operator 参数。
     """
 
     def buy_activation(self, *, service_code: str, country_code: str, operator: str, max_price: str | None) -> dict[str, Any]:
@@ -1047,8 +1047,7 @@ class SmsBowerClient(HeroSmsClient):
             "getNumber",
             service=service_code,
             country=country_code,
-            minPrice=exact_price,
-            maxPrice=exact_price,
+            fixPrice=exact_price,
         )
         return self._parse_purchase_payload(payload, service_code, country_code, operator)
 
