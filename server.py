@@ -1471,6 +1471,8 @@ class Sub2apiClient:
         auth_url = str(result.get("auth_url") or result.get("url") or "").strip()
         session_id = str(result.get("session_id") or "").strip()
         state = str(result.get("state") or "").strip()
+        if not state and auth_url:
+            state = str(parse_qs(urlparse(auth_url).query).get("state", [""])[-1]).strip()
         if not auth_url or not session_id or not state:
             raise Sub2apiError("sub2api OAuth 响应缺少 auth_url、session_id 或 state")
         return {"url": auth_url, "session_id": session_id, "state": state}
