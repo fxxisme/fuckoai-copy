@@ -24,6 +24,11 @@ ROOT   = Path(__file__).resolve().parent
 DIAG_DIR = Path(os.getenv("UC_SIGNUP_DIAG_DIR", str(ROOT / "diagnostics")))
 MAX_RETRIES    = 3   # 每步最大重试次数
 MAX_ERROR_REFRESH = 5  # 错误页刷新次数
+OAUTH_CONSENT_SELECTORS = (
+    "form[action*='/consent'] button[type='submit']:not([disabled])",
+    "form[action*='/consent'] input[type='submit']:not([disabled])",
+    "button[data-dd-action-name='Continue']:not([disabled])",
+)
 PHONE_RETRY_LIMIT = int(os.getenv("UC_SIGNUP_PHONE_RETRIES", "0"))
 SMS_TIMEOUT_SECONDS = int(os.getenv("UC_SIGNUP_SMS_TIMEOUT_SECONDS", "135"))
 SMS_POLL_INTERVAL_SECONDS = int(os.getenv("UC_SIGNUP_SMS_POLL_INTERVAL_SECONDS", "10"))
@@ -250,6 +255,72 @@ class SignupBot:
             log(f"  可选按钮不存在，跳过: {text}")
         return False
 
+    def approve_oauth_consent(self, timeout=15):
+        """在 OpenAI OAuth consent 页点击授权按钮，兼容 iframe 与文案变更。"""
+        deadline = time.time() + timeout
+        last_buttons = []
+
+        while time.time() < deadline:
+            if self._is_oauth_callback(self.d.current_url):
+                return
+
+            try:
+                page_text = (self.d.find_element(By.TAG_NAME, "body").text or "").lower()
+            except Exception:
+                page_text = ""
+            for signal, description in (
+                ("verify you are human", "人机验证"),
+                ("captcha", "验证码挑战"),
+                ("access denied", "访问被拒绝"),
+                ("unusual activity", "异常活动风控"),
+                ("too many requests", "请求过于频繁"),
+            ):
+                if signal in page_text:
+                    self.dump_diagnostics("oauth_blocked")
+                    raise FatalError(f"OAuth 授权被 OpenAI 拦截：{description}")
+
+            try:
+                self.d.switch_to.default_content()
+                frames = self.d.find_elements(By.TAG_NAME, "iframe")
+                contexts = [("主文档", None)] + [(f"iframe[{i}]", frame) for i, frame in enumerate(frames)]
+                for context_name, frame in contexts:
+                    self.d.switch_to.default_content()
+                    if frame is not None:
+                        self.d.switch_to.frame(frame)
+                    for selector in OAUTH_CONSENT_SELECTORS:
+                        for element in self.d.find_elements(By.CSS_SELECTOR, selector):
+                            try:
+                                if not element.is_displayed() or not element.is_enabled():
+                                    continue
+                                labels = tuple(filter(None, (
+                                    (element.text or "").strip(),
+                                    (element.get_attribute("aria-label") or "").strip(),
+                                    (element.get_attribute("value") or "").strip(),
+                                )))
+                                label = " / ".join(labels)
+                                if label:
+                                    last_buttons.append(label[:80])
+                                log(f"  OAuth 授权点击 ({context_name}, {selector}): {label[:80]}")
+                                ActionChains(self.d).move_to_element(element).click().perform()
+                                time.sleep(3)
+                                return
+                            except StaleElementReferenceException:
+                                continue
+            except FatalError:
+                raise
+            except Exception as e:
+                log(f"  OAuth 授权页扫描失败: {e}", "warn")
+            finally:
+                try:
+                    self.d.switch_to.default_content()
+                except Exception:
+                    pass
+            time.sleep(1)
+
+        self.dump_diagnostics("oauth_consent_missing")
+        labels = ", ".join(dict.fromkeys(last_buttons)) or "无可见按钮"
+        raise StepError(f"OAuth 授权页未找到授权按钮；可见按钮: {labels[:300]}")
+
     def fill(self, selector, value, retries=MAX_RETRIES):
         """填输入框"""
         for attempt in range(retries):
@@ -369,7 +440,7 @@ class SignupBot:
 
     def dump_diagnostics(self, tag=""):
         """把当前页面快照存到 DIAG_DIR，便于事后排查找不到控件等问题。
-        保存：URL/title、可见 input/select/textarea 清单、截图、整页 HTML。
+        保存：URL/title、可见表单控件与按钮清单、截图、整页 HTML。
         失败静默，绝不能影响主流程。返回写入的文件路径前缀或 None。"""
         if not self.d:
             return None
@@ -413,6 +484,19 @@ class SignupBot:
                     pass
                 rows.append(describe(el))
             summary.append(f"{kind} (visible={len(rows)}): {json.dumps(rows, ensure_ascii=False)}")
+        try:
+            buttons = []
+            for el in self.d.find_elements(By.CSS_SELECTOR, "button, [role=button], input[type=submit]"):
+                try:
+                    if el.is_displayed():
+                        label = (el.text or el.get_attribute("aria-label") or el.get_attribute("value") or "").strip()
+                        if label:
+                            buttons.append(label[:120])
+                except Exception:
+                    continue
+            summary.append(f"buttons (visible={len(buttons)}): {json.dumps(buttons, ensure_ascii=False)}")
+        except Exception:
+            pass
         # 检测 iframe，字段可能藏在框架内
         try:
             iframes = self.d.find_elements(By.TAG_NAME, "iframe")
@@ -784,7 +868,7 @@ class SignupBot:
 
             # 授权
             log(f"授权页: {self.d.title}")
-            self._step("授权", lambda: self.click("Continue"))
+            self._step("授权", self.approve_oauth_consent)
 
             # ═══ Part 3: 捕获 OAuth 回调并交给当前导入目标 ═══
             callback_url = ""
@@ -798,7 +882,7 @@ class SignupBot:
 
             if not callback_url:
                 # 可能在 consent 页没点到
-                self._step("重试授权", lambda: self.click("Continue"))
+                self._step("重试授权", self.approve_oauth_consent)
                 time.sleep(5)
                 for _ in range(10):
                     url = self.d.current_url
