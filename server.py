@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import math
 import os
 import random
 import re
@@ -79,6 +80,13 @@ APP_SETTING_FIELDS = (
     "TEMP_MAIL_ADMIN_PASSWORD",
     "CPA_BASE_URL",
     "CPA_MANAGEMENT_KEY",
+    "OAUTH_TARGET",
+    "SUB2API_BASE_URL",
+    "SUB2API_ADMIN_API_KEY",
+    "SUB2API_REDIRECT_URI",
+    "SUB2API_TIMEOUT_SEC",
+    "SUB2API_CONCURRENCY",
+    "SUB2API_PRIORITY",
     "SIGNUP_PASSWORD",
     "SIGNUP_NAME",
     "SIGNUP_AGE",
@@ -109,6 +117,13 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
     "TEMP_MAIL_ADMIN_PASSWORD": "",
     "CPA_BASE_URL": "",
     "CPA_MANAGEMENT_KEY": "",
+    "OAUTH_TARGET": "cpa",
+    "SUB2API_BASE_URL": "",
+    "SUB2API_ADMIN_API_KEY": "",
+    "SUB2API_REDIRECT_URI": "http://127.0.0.1:56121/callback",
+    "SUB2API_TIMEOUT_SEC": "300",
+    "SUB2API_CONCURRENCY": "10",
+    "SUB2API_PRIORITY": "1",
     "SIGNUP_PASSWORD": "FuckOAI123456!",
     "SIGNUP_NAME": "Fuck OAI",
     "SIGNUP_AGE": "18",
@@ -214,6 +229,14 @@ def normalize_fixed_price_value(value: Any) -> str:
     return "true" if text in {"1", "true", "yes", "on"} else "false" if text in {"0", "false", "no", "off"} else text
 
 
+def parse_finite_positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) and parsed > 0 else default
+
+
 @dataclass
 class UcSignupState:
     running: bool = False
@@ -291,6 +314,13 @@ class Config:
     temp_mail_admin_password: str = app_config_value("TEMP_MAIL_ADMIN_PASSWORD", "")
     cpa_base_url: str = app_config_value("CPA_BASE_URL", "")
     cpa_management_key: str = app_config_value("CPA_MANAGEMENT_KEY", "")
+    oauth_target: str = app_config_value("OAUTH_TARGET", "cpa")
+    sub2api_base_url: str = app_config_value("SUB2API_BASE_URL", "")
+    sub2api_admin_api_key: str = app_config_value("SUB2API_ADMIN_API_KEY", "")
+    sub2api_redirect_uri: str = app_config_value("SUB2API_REDIRECT_URI", "http://127.0.0.1:56121/callback")
+    sub2api_timeout_sec: float = 300.0
+    sub2api_concurrency: int = 10
+    sub2api_priority: int = 1
     browser_display: str = app_config_value("BROWSER_DISPLAY", ":1")
     browser_proxy: str = app_config_value("BROWSER_PROXY", "")
     uc_signup_proxy: str = app_config_value("UC_SIGNUP_PROXY", "")
@@ -319,6 +349,22 @@ class Config:
         self.temp_mail_admin_password = app_config_value("TEMP_MAIL_ADMIN_PASSWORD", "")
         self.cpa_base_url = app_config_value("CPA_BASE_URL", "").rstrip("/")
         self.cpa_management_key = app_config_value("CPA_MANAGEMENT_KEY", "")
+        self.oauth_target = app_config_value("OAUTH_TARGET", "cpa").strip().lower()
+        self.sub2api_base_url = app_config_value("SUB2API_BASE_URL", "").rstrip("/")
+        self.sub2api_admin_api_key = app_config_value("SUB2API_ADMIN_API_KEY", "")
+        self.sub2api_redirect_uri = app_config_value("SUB2API_REDIRECT_URI", "http://127.0.0.1:56121/callback").strip()
+        self.sub2api_timeout_sec = parse_finite_positive_float(
+            app_config_value("SUB2API_TIMEOUT_SEC", "300"),
+            300.0,
+        )
+        try:
+            self.sub2api_concurrency = max(int(app_config_value("SUB2API_CONCURRENCY", "10")), 1)
+        except ValueError:
+            self.sub2api_concurrency = 10
+        try:
+            self.sub2api_priority = max(int(app_config_value("SUB2API_PRIORITY", "1")), 1)
+        except ValueError:
+            self.sub2api_priority = 1
         self.browser_display = app_config_value("BROWSER_DISPLAY", ":1")
         self.browser_proxy = app_config_value("BROWSER_PROXY", "")
         self.uc_signup_proxy = app_config_value("UC_SIGNUP_PROXY", "")
@@ -1361,9 +1407,92 @@ class CpaClient:
         return self._request("GET", "/v0/management/auth-files")
 
 
+class Sub2apiError(Exception):
+    pass
+
+
+class Sub2apiClient:
+    MAX_RESPONSE_BYTES = 1_048_576
+
+    def __init__(self, base_url: str, admin_api_key: str, timeout_sec: float) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.admin_api_key = admin_api_key
+        self.timeout_seconds = parse_finite_positive_float(timeout_sec, 300.0)
+
+    def _headers(self) -> dict[str, str]:
+        if not self.admin_api_key:
+            raise Sub2apiError("未配置 SUB2API_ADMIN_API_KEY")
+        return {
+            "x-api-key": self.admin_api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "fuckoai-sub2api-client/1.0",
+        }
+
+    def _request(self, method: str, path: str, *, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not self.base_url:
+            raise Sub2apiError("未配置 SUB2API_BASE_URL")
+        data = json.dumps(body or {}).encode("utf-8")
+        request = Request(f"{self.base_url}{path}", data=data, method=method, headers=self._headers())
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                raw = response.read(self.MAX_RESPONSE_BYTES + 1)
+                if len(raw) > self.MAX_RESPONSE_BYTES:
+                    raise Sub2apiError("sub2api 响应过大")
+                text = raw.decode("utf-8", errors="replace").strip()
+        except HTTPError as error:
+            raw = error.read(self.MAX_RESPONSE_BYTES + 1)
+            if len(raw) > self.MAX_RESPONSE_BYTES:
+                body_text = "响应过大"
+            else:
+                body_text = raw.decode("utf-8", errors="replace").strip()
+            raise Sub2apiError(f"sub2api 请求失败: HTTP {error.code} {body_text}".strip()) from error
+        except URLError as error:
+            raise Sub2apiError(f"sub2api 连接失败: {error.reason}") from error
+        if not text:
+            return {}
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise Sub2apiError(f"sub2api 返回非 JSON: {text[:300]}") from error
+        if not isinstance(payload, dict):
+            raise Sub2apiError("sub2api 返回格式无效")
+        if payload.get("code") not in (None, 0, "0"):
+            raise Sub2apiError(str(payload.get("message") or payload))
+        data = payload.get("data", payload)
+        return data if isinstance(data, dict) else {"result": data}
+
+    def generate_auth_url(self) -> dict[str, Any]:
+        result = self._request(
+            "POST",
+            "/api/v1/admin/openai/generate-auth-url",
+            body={"redirect_uri": CONFIG.sub2api_redirect_uri},
+        )
+        auth_url = str(result.get("auth_url") or result.get("url") or "").strip()
+        session_id = str(result.get("session_id") or "").strip()
+        state = str(result.get("state") or "").strip()
+        if not auth_url or not session_id or not state:
+            raise Sub2apiError("sub2api OAuth 响应缺少 auth_url、session_id 或 state")
+        return {"url": auth_url, "session_id": session_id, "state": state}
+
+    def create_from_oauth(self, *, session_id: str, code: str, state: str, name: str = "") -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "session_id": session_id,
+            "code": code,
+            "state": state,
+            "redirect_uri": CONFIG.sub2api_redirect_uri,
+        }
+        if name.strip():
+            body["name"] = name.strip()
+        body["concurrency"] = CONFIG.sub2api_concurrency
+        body["priority"] = CONFIG.sub2api_priority
+        return self._request("POST", "/api/v1/admin/openai/create-from-oauth", body=body)
+
+
 CLIENTS: dict[str, HeroSmsClient | SmsBowerClient] = {}
 TEMP_MAIL = TempMailClient(CONFIG.temp_mail_api_url, CONFIG.temp_mail_admin_password, CONFIG.timeout_ms)
 CPA = CpaClient(CONFIG.cpa_base_url, CONFIG.cpa_management_key, CONFIG.timeout_ms)
+SUB2API = Sub2apiClient(CONFIG.sub2api_base_url, CONFIG.sub2api_admin_api_key, CONFIG.sub2api_timeout_sec)
 PURCHASE_GROUP_CURSOR_LOCK = threading.Lock()
 PURCHASE_GROUP_NEXT_INDEX = 0
 
@@ -1405,7 +1534,7 @@ reload_sms_clients()
 
 
 def reload_runtime_config() -> None:
-    global APP_CONFIG_VALUES, TEMP_MAIL, CPA
+    global APP_CONFIG_VALUES, TEMP_MAIL, CPA, SUB2API
 
     APP_CONFIG_VALUES = load_config_values()
     CONFIG.host = app_config_value("HOST", "0.0.0.0")
@@ -1432,6 +1561,22 @@ def reload_runtime_config() -> None:
     CONFIG.temp_mail_admin_password = app_config_value("TEMP_MAIL_ADMIN_PASSWORD", "")
     CONFIG.cpa_base_url = app_config_value("CPA_BASE_URL", "").rstrip("/")
     CONFIG.cpa_management_key = app_config_value("CPA_MANAGEMENT_KEY", "")
+    CONFIG.oauth_target = app_config_value("OAUTH_TARGET", "cpa").strip().lower()
+    CONFIG.sub2api_base_url = app_config_value("SUB2API_BASE_URL", "").rstrip("/")
+    CONFIG.sub2api_admin_api_key = app_config_value("SUB2API_ADMIN_API_KEY", "")
+    CONFIG.sub2api_redirect_uri = app_config_value("SUB2API_REDIRECT_URI", "http://127.0.0.1:56121/callback").strip()
+    CONFIG.sub2api_timeout_sec = parse_finite_positive_float(
+        app_config_value("SUB2API_TIMEOUT_SEC", "300"),
+        300.0,
+    )
+    try:
+        CONFIG.sub2api_concurrency = max(int(app_config_value("SUB2API_CONCURRENCY", "10")), 1)
+    except ValueError:
+        CONFIG.sub2api_concurrency = 10
+    try:
+        CONFIG.sub2api_priority = max(int(app_config_value("SUB2API_PRIORITY", "1")), 1)
+    except ValueError:
+        CONFIG.sub2api_priority = 1
     CONFIG.browser_display = app_config_value("BROWSER_DISPLAY", ":1")
     CONFIG.browser_proxy = app_config_value("BROWSER_PROXY", "")
     CONFIG.uc_signup_proxy = app_config_value("UC_SIGNUP_PROXY", "")
@@ -1449,6 +1594,7 @@ def reload_runtime_config() -> None:
     reload_sms_clients()
     TEMP_MAIL = TempMailClient(CONFIG.temp_mail_api_url, CONFIG.temp_mail_admin_password, CONFIG.timeout_ms)
     CPA = CpaClient(CONFIG.cpa_base_url, CONFIG.cpa_management_key, CONFIG.timeout_ms)
+    SUB2API = Sub2apiClient(CONFIG.sub2api_base_url, CONFIG.sub2api_admin_api_key, CONFIG.sub2api_timeout_sec)
 
 
 def make_admin_session_token() -> str:
@@ -1789,6 +1935,9 @@ class UcSignupManager:
         env["PYTHONUNBUFFERED"] = "1"
         env["UC_SIGNUP_API_BASE"] = str(options.get("apiBase") or f"http://127.0.0.1:{CONFIG.port}")
         env["UC_SIGNUP_DISPLAY"] = str(options.get("display") or CONFIG.browser_display)
+        env["UC_SIGNUP_OAUTH_TARGET"] = CONFIG.oauth_target
+        if CONFIG.sub2api_redirect_uri:
+            env["UC_SIGNUP_SUB2API_REDIRECT_URI"] = CONFIG.sub2api_redirect_uri
         if CONFIG.admin_password:
             env["UC_SIGNUP_ADMIN_PASSWORD"] = CONFIG.admin_password
         if proxy:
@@ -2772,6 +2921,9 @@ class AppHandler(BaseHTTPRequestHandler):
         except HeroSmsError as error:
             print(f"[API ERROR] {method} {parsed.path}: {type(error).__name__}: {error}", flush=True)
             self.send_json(500, {"error": str(error), "type": type(error).__name__, "path": parsed.path})
+        except Sub2apiError as error:
+            print(f"[API ERROR] {method} {parsed.path}: {type(error).__name__}: {error}", flush=True)
+            self.send_json(500, {"error": str(error), "type": type(error).__name__, "path": parsed.path})
         except Exception as error:
             print(f"[API ERROR] {method} {parsed.path}: {type(error).__name__}: {error}", flush=True)
             self.send_json(500, {"error": str(error), "type": type(error).__name__, "path": parsed.path})
@@ -2793,6 +2945,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     "configured": bool(get_client().api_key),
                     "tempMailConfigured": bool(CONFIG.temp_mail_api_url and CONFIG.temp_mail_admin_password),
                     "cpaConfigured": bool(CONFIG.cpa_base_url and CONFIG.cpa_management_key),
+                    "sub2apiConfigured": bool(CONFIG.sub2api_base_url and CONFIG.sub2api_admin_api_key),
+                    "oauthTarget": CONFIG.oauth_target,
                     "apiUrl": current_client_api_url(),
                     "smsProvider": current_provider(),
                     "providers": build_providers_status(),
@@ -2937,6 +3091,39 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if method == "GET" and path == "/api/temp-mail/settings":
             self.send_json(200, {"settings": TEMP_MAIL.get_settings()})
+            return
+
+        if method == "GET" and path == "/api/sub2api-openai/url":
+            result = SUB2API.generate_auth_url()
+            self.send_json(200, result)
+            return
+
+        if method == "POST" and path == "/api/sub2api-openai/callback":
+            body = self.read_json_body()
+            redirect_url = str(body.get("redirect_url") or "").strip()
+            session_id = str(body.get("session_id") or "").strip()
+            state_expected = str(body.get("state") or "").strip()
+            name = str(body.get("name") or "").strip()
+            parsed_redirect = urlparse(redirect_url)
+            if not parsed_redirect.scheme or not parsed_redirect.netloc:
+                raise Sub2apiError("OAuth 回调地址无效")
+            callback = parse_qs(parsed_redirect.query)
+            code = str((callback.get("code") or [""])[0]).strip()
+            state = str((callback.get("state") or [""])[0]).strip()
+            error = str((callback.get("error") or [""])[0]).strip()
+            if error:
+                raise Sub2apiError(f"OpenAI OAuth 返回错误: {error}")
+            if not session_id or not code or not state:
+                raise Sub2apiError("OAuth 回调缺少 session_id、code 或 state")
+            if state_expected and state != state_expected:
+                raise Sub2apiError("OAuth 回调 state 与请求不匹配")
+            result = SUB2API.create_from_oauth(
+                session_id=session_id,
+                code=code,
+                state=state,
+                name=name,
+            )
+            self.send_json(200, result)
             return
 
         if method == "GET" and path == "/api/codex-oauth/url":

@@ -6,6 +6,7 @@ ChatGPT 注册 + OAuth CPA 回调（最终版）
 import argparse, json, os, re, shutil, signal, subprocess, sys, time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -109,6 +110,7 @@ PW = os.getenv("SIGNUP_PASSWORD", PW)
 NAME = os.getenv("SIGNUP_NAME", NAME)
 AGE = os.getenv("SIGNUP_AGE", AGE)
 DISPLAY = os.getenv("UC_SIGNUP_DISPLAY", os.getenv("BROWSER_DISPLAY", DISPLAY))
+OAUTH_TARGET = os.getenv("UC_SIGNUP_OAUTH_TARGET", "cpa").strip().lower()
 CHROME_BINARY = detect_chrome_binary()
 CHROME_VERSION = detect_chrome_version(CHROME_BINARY)
 
@@ -594,10 +596,88 @@ class SignupBot:
                 raise
         raise FatalError(f"步骤 [{name}] 失败，已重试{MAX_RETRIES}次")
 
+    def _complete_cpa_oauth(self, callback_url, state):
+        """提交 CPA OAuth 回调，并输出 CPA 的异步处理状态。"""
+        log("📤 回填CPA...")
+        result = api("POST", "/api/codex-oauth/callback", {
+            "provider": "codex",
+            "redirect_url": callback_url,
+        })
+        log(f"  回填: {json.dumps(result, ensure_ascii=False)[:200]}")
+        status = api("GET", f"/api/codex-oauth/status?state={state}")
+        log(f"  状态: {json.dumps(status, ensure_ascii=False)[:200]}")
+        files = api("GET", "/api/codex-oauth/files")
+        log(f"  凭证: {json.dumps(files, ensure_ascii=False)[:500]}")
+
+    def _start_sub2api_oauth(self):
+        """创建由 sub2api 持有 PKCE 会话的 OpenAI OAuth 请求。"""
+        oauth = api("GET", "/api/sub2api-openai/url")
+        url = str(oauth.get("url") or "").strip()
+        session_id = str(oauth.get("session_id") or "").strip()
+        state = str(oauth.get("state") or "").strip()
+        if not url or not session_id or not state:
+            raise FatalError("sub2api OAuth 初始化响应缺少 url、session_id 或 state")
+        return url, {"session_id": session_id, "state": state}
+
+    def _complete_sub2api_oauth(self, callback_url, context):
+        """把浏览器回调交给 sub2api 创建 OpenAI OAuth 账号。"""
+        log("📤 导入sub2api OpenAI OAuth 账号...")
+        result = api("POST", "/api/sub2api-openai/callback", {
+            "redirect_url": callback_url,
+            "session_id": context["session_id"],
+            "state": context["state"],
+            "name": self.email,
+        })
+        log(f"  sub2api 导入: {json.dumps(result, ensure_ascii=False)[:500]}")
+
+    def _start_oauth(self):
+        """按配置创建 CPA 或 sub2api OAuth，保持两条导入链路独立。"""
+        if OAUTH_TARGET == "sub2api":
+            return self._start_sub2api_oauth()
+        if OAUTH_TARGET == "cpa":
+            oauth = api("GET", "/api/codex-oauth/url")
+            url = str(oauth.get("url") or "").strip()
+            state = str(oauth.get("state") or "").strip()
+            if not url or not state:
+                raise FatalError("CPA OAuth 初始化响应缺少 url 或 state")
+            return url, {"state": state}
+        raise FatalError(f"不支持的 OAUTH_TARGET: {OAUTH_TARGET!r}（仅支持 cpa 或 sub2api）")
+
+    def _complete_oauth(self, callback_url, context):
+        """按 OAuth 目标完成回调提交。"""
+        if OAUTH_TARGET == "sub2api":
+            return self._complete_sub2api_oauth(callback_url, context)
+        return self._complete_cpa_oauth(callback_url, context["state"])
+
+    def _is_oauth_callback(self, url):
+        """仅接受目标回调地址及包含 code/state 或 error 的 OAuth 回调。"""
+        try:
+            callback = urlparse(url)
+        except ValueError:
+            return False
+        if OAUTH_TARGET == "sub2api":
+            redirect_uri = os.getenv("UC_SIGNUP_SUB2API_REDIRECT_URI", "").strip()
+            if redirect_uri:
+                try:
+                    expected = urlparse(redirect_uri)
+                except ValueError:
+                    return False
+                if (callback.scheme, callback.hostname, callback.port, callback.path) != (
+                    expected.scheme,
+                    expected.hostname,
+                    expected.port,
+                    expected.path,
+                ):
+                    return False
+        elif callback.hostname != "localhost" or callback.port != 1455:
+            return False
+        query = parse_qs(callback.query)
+        return bool(query.get("code") and query.get("state")) or bool(query.get("error"))
+
     # ── 主流程 ───────────────────────────────────────────
     def run(self):
         log("=" * 55)
-        log("ChatGPT 注册 → OAuth → CPA 回调")
+        log(f"ChatGPT 注册 → OAuth ({OAUTH_TARGET})")
         log("=" * 55)
 
         phone = full_phone = activation_id = ""
@@ -652,10 +732,9 @@ class SignupBot:
                     continue
 
             # ═══ Part 2: OAuth（同一浏览器，保持登录态）═══
-            oa = api("GET", "/api/codex-oauth/url")
-            oa_url = oa.get("url", "")
-            oa_state = oa.get("state", "")
-            log(f"🔗 OAuth: {oa_state}")
+            oa_url, oauth_context = self._start_oauth()
+            oa_state = oauth_context["state"]
+            log(f"🔗 OAuth ({OAUTH_TARGET}): {oa_state}")
 
             self.d.get(oa_url)
             time.sleep(8)
@@ -707,12 +786,11 @@ class SignupBot:
             log(f"授权页: {self.d.title}")
             self._step("授权", lambda: self.click("Continue"))
 
-            # ═══ Part 3: 捕获回调 → CPA ═══
-            log("等待回调 localhost:1455...")
+            # ═══ Part 3: 捕获 OAuth 回调并交给当前导入目标 ═══
             callback_url = ""
             for _ in range(15):
                 url = self.d.current_url
-                if "localhost:1455" in url or "code=" in url:
+                if self._is_oauth_callback(url):
                     callback_url = url
                     log(f"  ✅ 回调: {url[:120]}")
                     break
@@ -724,7 +802,7 @@ class SignupBot:
                 time.sleep(5)
                 for _ in range(10):
                     url = self.d.current_url
-                    if "localhost:1455" in url or "code=" in url:
+                    if self._is_oauth_callback(url):
                         callback_url = url
                         log(f"  ✅ 回调: {url[:120]}")
                         break
@@ -733,17 +811,7 @@ class SignupBot:
             if not callback_url:
                 raise FatalError("OAuth回调超时")
 
-            # CPA 回填
-            log("📤 回填CPA...")
-            result = api("POST", "/api/codex-oauth/callback",
-                         {"provider": "codex", "redirect_url": callback_url})
-            log(f"  回填: {json.dumps(result, ensure_ascii=False)[:200]}")
-
-            status = api("GET", f"/api/codex-oauth/status?state={oa_state}")
-            log(f"  状态: {json.dumps(status, ensure_ascii=False)[:200]}")
-
-            files = api("GET", "/api/codex-oauth/files")
-            log(f"  凭证: {json.dumps(files, ensure_ascii=False)[:500]}")
+            self._complete_oauth(callback_url, oauth_context)
 
             # 清理
             try:

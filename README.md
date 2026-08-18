@@ -46,6 +46,32 @@ cp config.example.json config.json
 
 模板已包含 HeroSMS / SMSBower 接口地址、注册资料默认值和浏览器参数；接口密钥、临时邮箱、CPA 等用户配置默认为空。
 
+### OAuth 导入目标
+
+注册完成后由 `OAUTH_TARGET` 选择 OAuth 凭证导入目标：
+
+| 配置值 | 导入目标 | 必填配置 |
+| --- | --- | --- |
+| `cpa`（默认） | CPA / CLIProxyAPI | `CPA_BASE_URL`、`CPA_MANAGEMENT_KEY` |
+| `sub2api` | sub2api OpenAI OAuth 账号（`platform=openai`、`type=oauth`） | `SUB2API_BASE_URL`、`SUB2API_ADMIN_API_KEY` |
+
+使用 sub2api 时保留以下默认值即可，按实际调度需求调整并发和优先级：
+
+```json
+{
+  "OAUTH_TARGET": "sub2api",
+  "SUB2API_BASE_URL": "https://sub2api.example.com",
+  "SUB2API_ADMIN_API_KEY": "",
+  "SUB2API_REDIRECT_URI": "http://127.0.0.1:56121/callback",
+  "SUB2API_TIMEOUT_SEC": "300",
+  "SUB2API_CONCURRENCY": "10",
+  "SUB2API_PRIORITY": "1"
+}
+```
+
+`SUB2API_REDIRECT_URI` 是浏览器 OAuth 完成后的本机回调 URL；不需要额外启动 HTTP 服务，但三个位置必须保持一致：生成授权 URL、OpenAI 最终跳转地址、提交给 sub2api 的 OAuth 回调。容器使用 `network_mode: host`，默认 `127.0.0.1:56121` 指向运行容器的宿主机网络命名空间。
+
+
 ### 短信供应商
 
 支持两套收码供应商，协议兼容（均为 `handler_api.php` 体系），各自独立配置接口地址和密钥：

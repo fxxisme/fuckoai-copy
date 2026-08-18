@@ -499,6 +499,9 @@
       "SMSBOWER_API_KEY", "SMSBOWER_API_URL", "SMS_PROVIDER",
       "TEMP_MAIL_API_URL", "TEMP_MAIL_ADMIN_PASSWORD",
       "CPA_BASE_URL", "CPA_MANAGEMENT_KEY",
+      "OAUTH_TARGET",
+      "SUB2API_BASE_URL", "SUB2API_ADMIN_API_KEY", "SUB2API_REDIRECT_URI", "SUB2API_TIMEOUT_SEC",
+      "SUB2API_CONCURRENCY", "SUB2API_PRIORITY",
       "SIGNUP_PASSWORD", "SIGNUP_NAME", "SIGNUP_AGE",
       "BROWSER_DISPLAY", "BROWSER_PROXY", "UC_SIGNUP_PROXY",
       "UC_SIGNUP_PHONE_RETRIES", "UC_SIGNUP_SMS_TIMEOUT_SECONDS",
@@ -518,6 +521,13 @@
       TEMP_MAIL_ADMIN_PASSWORD: "临时邮箱管理员密码",
       CPA_BASE_URL: "CPA / OAuth 服务地址",
       CPA_MANAGEMENT_KEY: "CPA 管理密钥",
+      OAUTH_TARGET: "OAuth 导入目标（cpa 或 sub2api）",
+      SUB2API_BASE_URL: "sub2api 服务地址",
+      SUB2API_ADMIN_API_KEY: "sub2api 管理 API 密钥",
+      SUB2API_REDIRECT_URI: "sub2api OAuth 回调地址",
+      SUB2API_TIMEOUT_SEC: "sub2api 请求超时秒数",
+      SUB2API_CONCURRENCY: "sub2api 账号并发数",
+      SUB2API_PRIORITY: "sub2api 账号优先级",
       SIGNUP_PASSWORD: "注册账号默认密码",
       SIGNUP_NAME: "注册资料默认姓名",
       SIGNUP_AGE: "注册资料默认年龄",
@@ -538,7 +548,7 @@
     const secretKeys = new Set([
       "HERO_SMS_API_KEY", "SMSBOWER_API_KEY",
       "TEMP_MAIL_ADMIN_PASSWORD",
-      "CPA_MANAGEMENT_KEY", "SIGNUP_PASSWORD",
+      "CPA_MANAGEMENT_KEY", "SUB2API_ADMIN_API_KEY", "SIGNUP_PASSWORD",
     ]);
     const PURCHASE_PROVIDERS = [
       { key: "hero", label: "HeroSMS" },
