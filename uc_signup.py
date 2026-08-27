@@ -229,6 +229,52 @@ class SignupBot:
                     time.sleep(2)
         raise StepError(f"点击失败(已重试{retries}次): {text}")
 
+    def click_about_you_submit(self, timeout=12):
+        """提交姓名/年龄页，优先使用与语言无关的表单和动作属性。"""
+        selectors = (
+            "form[action*='/about-you'] button[data-dd-action-name='Continue'][type='submit']",
+            "form[action*='/about-you'] button[type='submit']",
+            "button[data-dd-action-name='Continue'][type='submit']",
+            "button[type='submit'][data-login-web-auth-control='true']",
+        )
+        deadline = time.time() + timeout
+        last_state = ""
+
+        while time.time() < deadline:
+            self.wait_ready(timeout=2)
+            seen = set()
+            for selector in selectors:
+                for btn in self.d.find_elements(By.CSS_SELECTOR, selector):
+                    if btn.id in seen:
+                        continue
+                    seen.add(btn.id)
+                    try:
+                        if not btn.is_displayed():
+                            continue
+                        disabled = (
+                            not btn.is_enabled()
+                            or btn.get_attribute("disabled") is not None
+                            or btn.get_attribute("aria-disabled") == "true"
+                            or btn.get_attribute("aria-busy") == "true"
+                        )
+                        if disabled:
+                            last_state = "按钮仍处于 disabled/loading 状态"
+                            continue
+                        label = (btn.text or "").strip()
+                        log(f"  点击姓名年龄提交按钮 ({selector}): {label[:50]}")
+                        ActionChains(self.d).move_to_element(btn).click().perform()
+                        time.sleep(3)
+                        return
+                    except StaleElementReferenceException:
+                        continue
+                    except Exception as e:
+                        last_state = str(e)
+
+            time.sleep(1)
+
+        detail = f": {last_state}" if last_state else ""
+        raise StepError(f"未找到可点击的姓名年龄提交按钮{detail}")
+
     def click_optional(self, text, wait_seconds=5):
         """点击可选按钮；不存在或点不了时跳过，不阻断流程。"""
         deadline = time.time() + wait_seconds
@@ -652,7 +698,7 @@ class SignupBot:
         self._step("姓名年龄", lambda: (
             self.fill("input[name=name]", NAME),
             self.fill_birth_year(AGE),
-            self.click("Finish creating account")
+            self.click_about_you_submit()
         ))
         time.sleep(8)
         log(f"✅ 注册完成: {self.d.title}")
