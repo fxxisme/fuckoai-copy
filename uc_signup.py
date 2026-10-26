@@ -30,6 +30,19 @@ OAUTH_CONSENT_SELECTORS = (
     "button[data-dd-action-name='Continue']:not([disabled])",
 )
 PHONE_RETRY_LIMIT = int(os.getenv("UC_SIGNUP_PHONE_RETRIES", "0"))
+PHONE_INPUT_SELECTORS = (
+    "#mobile-auth-phone",
+    "input[name='login_hint']",
+    "input[type='tel']",
+    "input[autocomplete='tel']",
+    "input[inputmode='tel']",
+    "input[name='phoneNumberInput']",
+)
+BUTTON_TEXT_ALIASES = {
+    "Continue": ("Continue", "继续", "下一步", "Next"),
+    "Continue with phone": ("Continue with phone", "继续使用手机号", "通过手机继续", "使用手机号继续", "使用电话号码继续"),
+    "Accept all": ("Accept all", "全部接受", "接受全部", "允许所有 Cookie", "Accept all cookies"),
+}
 SMS_TIMEOUT_SECONDS = int(os.getenv("UC_SIGNUP_SMS_TIMEOUT_SECONDS", "135"))
 SMS_POLL_INTERVAL_SECONDS = int(os.getenv("UC_SIGNUP_SMS_POLL_INTERVAL_SECONDS", "10"))
 PHONE_PASSWORD_PAGE_TIMEOUT = int(os.getenv("UC_SIGNUP_PHONE_PASSWORD_PAGE_TIMEOUT", "25"))
@@ -191,18 +204,38 @@ class SignupBot:
     # ── 元素操作（带重试）────────────────────────────────
     def _find_button(self, text):
         """找到匹配的按钮元素"""
+        if isinstance(text, (list, tuple, set)):
+            texts = list(text)
+        else:
+            texts = list(BUTTON_TEXT_ALIASES.get(text, [text]))
+
         # 精确匹配
         for b in self.d.find_elements(By.TAG_NAME, "button"):
             try:
                 bt = (b.text or "").strip()
-                if bt == text: return b
+                if any(bt == t for t in texts): return b
             except StaleElementReferenceException: continue
         # 包含匹配（排除 "Continue with xxx"）
         for b in self.d.find_elements(By.TAG_NAME, "button"):
             try:
                 bt = (b.text or "").strip()
-                if text in bt and not bt.startswith("Continue with"): return b
+                if any(t in bt and (not bt.startswith("Continue with") or any("Continue with" in x for x in texts)) for t in texts): return b
             except StaleElementReferenceException: continue
+
+        # 兜底：若目标是继续/下一步，尝试匹配可见的 submit 或 DD 动作按钮
+        if any(t in ("Continue", "继续") for t in texts):
+            fallback_selectors = (
+                "button[data-dd-action-name='Continue']",
+                "button[type='submit']",
+                "button[data-login-web-auth-control='true']",
+            )
+            for sel in fallback_selectors:
+                for b in self.d.find_elements(By.CSS_SELECTOR, sel):
+                    try:
+                        if b.is_displayed() and b.is_enabled():
+                            return b
+                    except StaleElementReferenceException:
+                        continue
         return None
 
     def click(self, text, retries=MAX_RETRIES, refresh_on_fail=True):
@@ -670,14 +703,14 @@ class SignupBot:
             self.prepare_phone_signup_page()
 
         self._step("填手机号", lambda: (
-            self.fill("input[name=phoneNumberInput]", full_phone),
+            self.fill_any(PHONE_INPUT_SELECTORS, full_phone),
             self.click("Continue")
         ))
         self.wait_password_input_after_phone()
         log(f"→ {self.d.title}")
 
         self._step("填密码", lambda: (
-            self.fill("input[name=new-password]", PW),
+            self.fill_any(["input[name=new-password]", "input[autocomplete='new-password']", "input[type=password]"], PW),
             self.click("Continue")
         ))
         self.wait_url_contains("contact-verification")
@@ -881,7 +914,7 @@ class SignupBot:
                 self._step("OAuth手机号", lambda: (
                     self.d.get("https://auth.openai.com/log-in?usernameKind=phone_number"),
                     time.sleep(5),
-                    self.fill_any(["input[type=tel]"], full_phone),
+                    self.fill_any(PHONE_INPUT_SELECTORS, full_phone),
                     self.click("Continue"), time.sleep(5)
                 ))
                 log(f"  → {self.d.title}")
