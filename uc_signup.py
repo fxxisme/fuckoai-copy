@@ -498,7 +498,8 @@ class SignupBot:
             cur_url = self.d.current_url.lower()
             cur_title = (self.d.title or "").lower()
             if "about-you" not in cur_url and "how old are you" not in cur_title and not self.is_error_page():
-                return
+                if "check your phone" not in cur_title and "contact-verification" not in cur_url:
+                    return
 
             self.fill_any(["input[name='name']", "input[autocomplete='name']"], full_name)
             self.fill_birth_year(AGE)
@@ -1135,95 +1136,17 @@ class SignupBot:
                     log("  从头开始注册，邮箱按需延迟创建", "warn")
                     continue
 
-            # ═══ Part 2: OAuth（全新干净会话，避免旧会话冲突触发 Oops）═══
+            # ═══ Part 2: OAuth（同一浏览器复用登录态，自适应状态机推进）═══
             oa_url, oauth_context = self._start_oauth()
             oa_state = oauth_context["state"]
             log(f"🔗 OAuth ({OAUTH_TARGET}): {oa_state}")
 
-            # 隔离注册旧会话，重置浏览器环境（对齐手动导入的独立登录环境）
-            log("  隔离注册阶段旧会话，重置浏览器环境...")
-            self.close_browser()
-            self.launch()
-
             self.d.get(oa_url)
-            time.sleep(6)
+            time.sleep(5)
             log(f"OAuth: {self.d.title} | {self.d.current_url[:80]}")
-            self.click_optional("Accept all", wait_seconds=3)
 
-            # 若未直接重定向回调，则走标准凭证登录
-            if not self._is_oauth_callback(self.d.current_url):
-                if "choose-an-account" in self.d.current_url.lower():
-                    self._step("选账户", lambda: self._click_account_button())
-
-                if not self._is_oauth_callback(self.d.current_url) and "consent" not in self.d.current_url.lower():
-                    self._step("OAuth手机号展开", lambda: self._ensure_phone_login_input())
-                    self._step("OAuth手机号", lambda: self._fill_oauth_phone_if_needed(full_phone))
-                    log(f"  → {self.d.title}")
-
-                    self._step("OAuth密码", lambda: self._fill_oauth_password_if_needed(PW))
-                    log(f"  → {self.d.title}")
-
-            # 补填资料：若密码提交后进入 How old are you? / about-you
-            if self._wait_and_check_about_you_step(timeout=8):
-                log("  检测到需要补填姓名年龄资料 (How old are you?)")
-                self._step("补填姓名年龄", self.submit_about_you_and_wait)
-                log(f"  → {self.d.title}")
-
-            # 绑定邮箱：若页面要求绑定邮箱（URL 包含 add-email 或存在邮箱输入框）
-            if self._wait_and_check_email_step(timeout=8):
-                email = self.ensure_email()
-                log(f"  邮箱: {email}")
-                self._step("绑定邮箱", lambda: (
-                    self.fill_any(["input[type=email]", "input[name=email]"], email),
-                    self.click("Continue"), time.sleep(5)
-                ))
-                log(f"  → {self.d.title}")
-
-                code2 = self.poll_email(email)
-                if not code2: raise FatalError("邮箱码超时")
-                log(f"  邮箱码: {code2}")
-
-                self._step("邮箱验证", lambda: (
-                    self.fill_any([
-                        "input[name=code]",
-                        "input[autocomplete='one-time-code']",
-                        "input[inputmode='numeric']"
-                    ], code2),
-                    self.click("Continue"), time.sleep(5)
-                ))
-                log(f"  → {self.d.title}")
-
-            # 授权：若未完成回调，在 consent 授权页确认
-            if not self._is_oauth_callback(self.d.current_url):
-                log(f"授权页: {self.d.title}")
-                self._step("授权", self.approve_oauth_consent)
-
-            # ═══ Part 3: 捕获 OAuth 回调并交给当前导入目标 ═══
-            callback_url = ""
-            for _ in range(15):
-                url = self.d.current_url
-                if self._is_oauth_callback(url):
-                    callback_url = url
-                    log(f"  ✅ 回调: {url[:120]}")
-                    break
-                time.sleep(2)
-
-            if not callback_url:
-                # 可能在 consent 页没点到
-                self._step("重试授权", self.approve_oauth_consent)
-                time.sleep(5)
-                for _ in range(10):
-                    url = self.d.current_url
-                    if self._is_oauth_callback(url):
-                        callback_url = url
-                        log(f"  ✅ 回调: {url[:120]}")
-                        break
-                    time.sleep(2)
-
-            if not callback_url:
-                raise FatalError("OAuth回调超时")
-
-            self._complete_oauth(callback_url, oauth_context)
+            # 统一状态机自动推进（按页面实际状态识别点击账号、过盾、补填资料、授权）
+            self.drive_oauth_flow(oauth_context, phone=full_phone, timeout=120)
 
             # 清理
             try:
@@ -1260,27 +1183,176 @@ class SignupBot:
             self.close_browser()
         return False
 
-    def _click_account_button(self):
-        """choose-account 页面：优先切换为独立登录，或点击已有账户"""
-        other_btn = self._find_button(("Use another account", "使用其他账户", "使用其他账号", "Log in with a different account"))
-        if other_btn:
+    def _click_account_card(self, phone=""):
+        """在 choose-an-account 页面精准点击目标账号卡片（避开删除按钮 x）"""
+        self.wait_ready(timeout=3)
+        clean_digits = re.sub(r'\D', '', phone)
+        suffix = clean_digits[-7:] if len(clean_digits) >= 7 else clean_digits
+
+        # 遍历所有可能的账号卡片容器
+        candidates = []
+        for el in self.d.find_elements(By.CSS_SELECTOR, "button, [role='button'], div[tabindex='0'], li, div[class*='wrapper']"):
             try:
-                log(f"  choose-account 切换为独立登录: {other_btn.text.strip()[:50]}")
-                ActionChains(self.d).move_to_element(other_btn).click().perform()
-                time.sleep(3)
-                return
+                if not el.is_displayed():
+                    continue
+                txt = (el.text or "").strip()
+                if any(x in txt for x in ("Use another account", "Create account", "使用其他账户", "创建账户", "OR")):
+                    continue
+                if ("+" in txt and len(txt) > 8) or (suffix and suffix in txt) or (NAME and NAME.split()[0].lower() in txt.lower()):
+                    candidates.append((el, txt))
+            except Exception:
+                continue
+
+        if candidates:
+            best_el, best_txt = candidates[0]
+            for el, txt in candidates:
+                if el.tag_name.lower() == "button" and len(txt) < len(best_txt):
+                    best_el, best_txt = el, txt
+            log(f"  点击账号卡片: {best_txt.replace(chr(10), ' ')[:60]}")
+            rect = best_el.rect
+            x_offset = -int(rect['width'] * 0.25)
+            try:
+                ActionChains(self.d).move_to_element_with_offset(best_el, x_offset, 0).click().perform()
+            except Exception:
+                best_el.click()
+            time.sleep(4)
+            return True
+
+        for el in self.d.find_elements(By.XPATH, "//*[contains(text(), '+') or contains(text(), 'sara') or contains(text(), 'mark')]"):
+            try:
+                if el.is_displayed():
+                    txt = (el.text or "").strip()
+                    if not any(x in txt for x in ("Use another", "Create")):
+                        log(f"  点击账号文本节点: {txt[:40]}")
+                        el.click()
+                        time.sleep(4)
+                        return True
             except Exception:
                 pass
-        for b in self.d.find_elements(By.TAG_NAME, "button"):
+
+        raise StepError("在 choose-an-account 页面未找到目标账号卡片")
+
+    def _click_oauth_consent_button(self):
+        """尝试点击 OAuth consent 授权页面的授权按钮"""
+        try:
+            self.d.switch_to.default_content()
+            for sel in OAUTH_CONSENT_SELECTORS:
+                for el in self.d.find_elements(By.CSS_SELECTOR, sel):
+                    try:
+                        if not el.is_displayed() or not el.is_enabled():
+                            continue
+                        label = (el.text or el.get_attribute("aria-label") or el.get_attribute("value") or "").strip()
+                        log(f"  点击 OAuth 授权按钮: {label[:50]}")
+                        ActionChains(self.d).move_to_element(el).click().perform()
+                        return True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return False
+
+    def drive_oauth_flow(self, oauth_context, phone="", timeout=120):
+        """统一自适应状态机推进 OAuth 流程，按页面实际状态动态响应"""
+        deadline = time.time() + timeout
+        last_logged_state = ""
+
+        while time.time() < deadline:
+            current_url = self.d.current_url
+            url = current_url.lower()
+            title = (self.d.title or "").lower()
+
+            # 1. 成功出口：命中目标回调地址
+            if self._is_oauth_callback(current_url):
+                log(f"  ✅ 捕获 OAuth 回调: {current_url[:120]}")
+                self._complete_oauth(current_url, oauth_context)
+                return True
+
+            # 2. 错误页处理：若遇 Oops/error 页面，刷新恢复
+            if self.is_error_page():
+                log(f"  检测到错误页 ({self.d.title})，刷新恢复...", "warn")
+                self.d.refresh()
+                time.sleep(6)
+                continue
+
+            # 3. Cloudflare Turnstile 人机验证
+            if self.handle_turnstile_if_present(timeout=8):
+                time.sleep(2)
+                continue
+
+            # 4. 账号选择页面（choose-an-account / Welcome back）
+            if "choose-an-account" in url or "welcome back" in title or "choose an account" in title:
+                state_key = "choose_account"
+                if last_logged_state != state_key:
+                    log("  处于选择账号页面 (Choose an account)，点击账号卡片...")
+                    last_logged_state = state_key
+                try:
+                    self._click_account_card(phone)
+                except StepError as e:
+                    log(f"  点击账号卡片重试: {e}", "warn")
+                time.sleep(3)
+                continue
+
+            # 5. 补填资料页面（How old are you? / about-you）
+            if "about-you" in url or "how old are you" in title:
+                state_key = "about_you"
+                if last_logged_state != state_key:
+                    log("  处于资料补充页面 (How old are you)，自动填写提交...")
+                    last_logged_state = state_key
+                try:
+                    self.submit_about_you_and_wait(timeout=15)
+                except Exception as e:
+                    log(f"  补填资料重试: {e}", "warn")
+                time.sleep(3)
+                continue
+
+            # 6. 绑定邮箱页面（add-email 或出现邮箱输入框）
+            has_email_input = False
             try:
-                bt = (b.text or "").strip()
-                if "Select account" in bt or ("+" in bt and len(bt) > 10):
-                    log(f"  点击: {bt[:60]}")
-                    ActionChains(self.d).move_to_element(b).click().perform()
-                    time.sleep(5)
-                    return
-            except: pass
-        raise StepError("找不到账户按钮")
+                for inp in self.d.find_elements(By.CSS_SELECTOR, "input[type='email'], input[name='email']"):
+                    if inp.is_displayed():
+                        has_email_input = True
+                        break
+            except Exception:
+                pass
+
+            if "add-email" in url or has_email_input:
+                state_key = "add_email"
+                if last_logged_state != state_key:
+                    log("  处于邮箱绑定页面...")
+                    last_logged_state = state_key
+                email = self.ensure_email()
+                log(f"  填入邮箱: {email}")
+                try:
+                    self.fill_any(["input[type=email]", "input[name=email]"], email)
+                    self.click("Continue")
+                    time.sleep(4)
+                    code2 = self.poll_email(email)
+                    if not code2:
+                        raise FatalError("邮箱码超时")
+                    log(f"  邮箱码: {code2}")
+                    self.fill_any(["input[name=code]", "input[autocomplete='one-time-code']", "input[inputmode='numeric']"], code2)
+                    self.click("Continue")
+                    time.sleep(4)
+                except Exception as e:
+                    log(f"  绑定邮箱过程重试: {e}", "warn")
+                continue
+
+            # 7. 授权 Consent 确认页面（含有授权按钮）
+            if "consent" in url or "authorize" in url:
+                state_key = "consent"
+                if last_logged_state != state_key:
+                    log(f"  处于授权确认页面 ({self.d.title})...")
+                    last_logged_state = state_key
+                clicked_consent = self._click_oauth_consent_button()
+                if clicked_consent:
+                    time.sleep(4)
+                    continue
+
+            # 8. 兜底点击可选按钮（Cookie 弹窗）
+            self.click_optional("Accept all", wait_seconds=1)
+            time.sleep(2)
+
+        raise FatalError("OAuth 状态机推进超时，未获得回调地址")
 
     def _ensure_phone_login_input(self):
         """确保当前登录页展示手机号输入框"""
