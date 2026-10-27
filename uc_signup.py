@@ -502,7 +502,7 @@ class SignupBot:
                     return
 
             self.fill_any(["input[name='name']", "input[autocomplete='name']"], full_name)
-            self.fill_birth_year(AGE)
+            self.fill_age_or_birthday(AGE)
             time.sleep(1)
             self.click_about_you_submit()
 
@@ -847,42 +847,151 @@ class SignupBot:
         log(f"  诊断已保存: {prefix}.*", "warn")
         return str(prefix)
 
-    def fill_birth_year(self, age_str: str):
-        """填年龄或出生年份：优先试 input[name=age]，失败则用当前年份反推出生年份"""
+    def fill_age_or_birthday(self, age_str: str):
+        """自适应填入年龄或生日（兼容纯年龄、完整日期、分段年月日、旧版年份框）"""
         try:
-            self.fill("input[name=age]", str(age_str), retries=1)
-            return
-        except StepError:
-            pass
-
-        # 反推出生年份
-        try:
-            birth_year = str(datetime.now().year - int(age_str))
+            age_int = int(age_str)
         except (ValueError, TypeError):
-            raise StepError(f"无效的年龄值: {age_str}")
+            age_int = 25
+        birth_year = str(datetime.now().year - age_int)
+        birth_month = "08"
+        birth_day = "15"
+        birth_iso = f"{birth_year}-{birth_month}-{birth_day}"
 
-        log(f"  input[name=age] 不可用，尝试出生年份 {birth_year}")
+        # 1. 优先尝试直接填写年龄（如 input[name=age] 或属性带 age 的输入框）
+        age_selectors = [
+            "input[name='age']",
+            "input[id*='-age']",
+            "input[placeholder*='年龄']",
+            "input[placeholder*='Age' i]",
+            "input[aria-label*='年龄']",
+            "input[aria-label*='age' i]",
+        ]
+        for sel in age_selectors:
+            for el in self.d.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if el.is_displayed():
+                        self.fill(sel, str(age_int), retries=1)
+                        # 顺带同步隐藏的 birthday 字段，防止被默认值(如当天日期)导致后端落库校验失败
+                        try:
+                            self.d.execute_script("""
+                                const b = document.querySelector("input[name='birthday'][type='hidden']");
+                                if (b) {
+                                    b.value = arguments[0];
+                                    b.dispatchEvent(new Event('input', { bubbles: true }));
+                                    b.dispatchEvent(new Event('change', { bubbles: true }));
+                                }
+                            """, birth_iso)
+                        except Exception:
+                            pass
+                        log(f"  已填入年龄: {age_int}")
+                        return
+                except Exception:
+                    continue
 
-        selectors = [
-            "input[name=birthYear]",
-            "input[name=birth_year]",
+        # 2. 检查年月日分段输入框 (React Aria DateField 或 独立分段 inputs)
+        m_el, d_el, y_el = None, None, None
+        for sel in ["input[name='month']", "input[aria-label*='month' i]", "input[aria-label*='月' i]", "div[role='spinbutton'][aria-label*='month' i]", "div[role='spinbutton'][aria-label*='月' i]"]:
+            for el in self.d.find_elements(By.CSS_SELECTOR, sel):
+                if el.is_displayed():
+                    m_el = el; break
+            if m_el: break
+
+        for sel in ["input[name='day']", "input[aria-label*='day' i]", "input[aria-label*='日' i]", "div[role='spinbutton'][aria-label*='day' i]", "div[role='spinbutton'][aria-label*='日' i]"]:
+            for el in self.d.find_elements(By.CSS_SELECTOR, sel):
+                if el.is_displayed():
+                    d_el = el; break
+            if d_el: break
+
+        for sel in ["input[name='year']", "input[name='birthYear']", "input[aria-label*='year' i]", "input[aria-label*='年' i]", "div[role='spinbutton'][aria-label*='year' i]", "div[role='spinbutton'][aria-label*='年' i]"]:
+            for el in self.d.find_elements(By.CSS_SELECTOR, sel):
+                if el.is_displayed():
+                    y_el = el; break
+            if y_el: break
+
+        if m_el or d_el or y_el:
+            log(f"  检测到生日分段输入框，填入生日: {birth_year}-{birth_month}-{birth_day}")
+            for el, val in ((m_el, birth_month), (d_el, birth_day), (y_el, birth_year)):
+                if el:
+                    try:
+                        ActionChains(self.d).move_to_element(el).click().perform()
+                        time.sleep(0.1)
+                        try: el.clear()
+                        except: pass
+                        for ch in str(val):
+                            el.send_keys(ch)
+                            time.sleep(0.03)
+                    except Exception as e:
+                        log(f"  填入生日段失败: {e}", "warn")
+            return
+
+        # 3. 检查单字段生日输入框 (type='date' 或带有 birthday 的输入框)
+        date_selectors = [
+            "input[type='date']",
+            "input[name='birthday']:not([type='hidden'])",
+            "input[name*='birthday' i]:not([type='hidden'])",
+            "input[name*='dob' i]:not([type='hidden'])",
+            "input[id*='birthday' i]:not([type='hidden'])",
+            "input[placeholder*='YYYY' i]",
+            "input[placeholder*='生日' i]",
+            "input[placeholder*='Birthday' i]",
+            "input[aria-label*='birthday' i]",
+        ]
+        for sel in date_selectors:
+            for el in self.d.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if not el.is_displayed():
+                        continue
+                    log(f"  检测到生日输入框 ({sel})，填入: {birth_iso}")
+                    ActionChains(self.d).move_to_element(el).click().perform()
+                    time.sleep(0.2)
+                    try: el.clear()
+                    except: pass
+                    for ch in birth_iso:
+                        el.send_keys(ch)
+                        time.sleep(0.03)
+                    try:
+                        self.d.execute_script("""
+                            const el = arguments[0];
+                            const val = arguments[1];
+                            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value') ?
+                                Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set : null;
+                            if (setter) {
+                                setter.call(el, val);
+                            } else {
+                                el.value = val;
+                            }
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                            el.dispatchEvent(new Event('blur', { bubbles: true }));
+                        """, el, birth_iso)
+                    except Exception:
+                        pass
+                    return
+                except Exception:
+                    continue
+
+        # 4. 仅出生年份框兜底
+        year_selectors = [
+            "input[name='birthYear']",
+            "input[name='birth_year']",
             "input[placeholder*=year i]",
             "input[placeholder*=出生]",
             "input[aria-label*=year i]",
             "input[id*=birth i]",
             "input[id*=year i]",
-            "input[name=age]",
         ]
-        for sel in selectors:
-            els = self.d.find_elements(By.CSS_SELECTOR, sel)
-            if els:
+        for sel in year_selectors:
+            for el in self.d.find_elements(By.CSS_SELECTOR, sel):
                 try:
-                    self.fill(sel, birth_year)
-                    return
+                    if el.is_displayed():
+                        self.fill(sel, birth_year)
+                        log(f"  已填入出生年份: {birth_year}")
+                        return
                 except StepError:
                     continue
 
-        # 最后：打印当前页所有可见 input 的标识属性，帮助后续诊断
+        # 兜底：抓取页面所有 input 便于排查
         inputs_info = []
         for el in self.d.find_elements(By.CSS_SELECTOR, "input:not([type=hidden])"):
             try:
@@ -891,9 +1000,12 @@ class SignupBot:
             except Exception:
                 pass
         log(f"  当前页面可见 input: {inputs_info}", "warn")
-        # 兜底：找不到年龄框时把页面快照存盘，便于事后排查（分步表单/select/iframe 等）
-        self.dump_diagnostics("fill_birth_year_missing_age")
-        raise StepError("找不到年龄/出生年份输入框")
+        self.dump_diagnostics("fill_age_or_birthday_missing")
+        raise StepError("未找到年龄或生日输入框")
+
+    def fill_birth_year(self, age_str: str):
+        """向后兼容别名：调用 fill_age_or_birthday"""
+        return self.fill_age_or_birthday(age_str)
 
     def cancel_activation(self, activation_id, reason="", provider=""):
         if not activation_id:
