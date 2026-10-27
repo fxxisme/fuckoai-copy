@@ -22,12 +22,15 @@ PROXY  = os.getenv("UC_SIGNUP_PROXY", os.getenv("BROWSER_PROXY", os.getenv("PROX
 ROOT   = Path(__file__).resolve().parent
 # 出错诊断转储目录（可被 UC_SIGNUP_DIAG_DIR 覆盖，便于 docker 挂载持久卷）
 DIAG_DIR = Path(os.getenv("UC_SIGNUP_DIAG_DIR", str(ROOT / "diagnostics")))
+TURNSTILE_PATCH_DIR = Path(os.getenv("UC_SIGNUP_TURNSTILE_PATCH_DIR", str(ROOT / "turnstilePatch")))
 MAX_RETRIES    = 3   # 每步最大重试次数
 MAX_ERROR_REFRESH = 5  # 错误页刷新次数
 OAUTH_CONSENT_SELECTORS = (
     "form[action*='/consent'] button[type='submit']:not([disabled])",
     "form[action*='/consent'] input[type='submit']:not([disabled])",
     "button[data-dd-action-name='Continue']:not([disabled])",
+    "button[name='action'][value='consent']:not([disabled])",
+    "button[value='accept']:not([disabled])",
 )
 PHONE_RETRY_LIMIT = int(os.getenv("UC_SIGNUP_PHONE_RETRIES", "0"))
 PHONE_INPUT_SELECTORS = (
@@ -167,6 +170,10 @@ class SignupBot:
                 "--lang=zh-CN","--window-size=1440,900"]
         if PROXY:
             args.append(f"--proxy-server={PROXY}")
+        if TURNSTILE_PATCH_DIR.is_dir():
+            patch_path = str(TURNSTILE_PATCH_DIR.resolve())
+            args.append(f"--load-extension={patch_path}")
+            log(f"  加载过盾扩展: {TURNSTILE_PATCH_DIR.name}")
         for a in args:
             opts.add_argument(a)
         if not os.path.isfile(CHROMEDRIVER_BINARY) or not os.access(CHROMEDRIVER_BINARY, os.X_OK):
@@ -179,14 +186,180 @@ class SignupBot:
         )
         log(f"  webdriver={self.d.execute_script('return navigator.webdriver')}")
 
-    # ── 页面等待 ────────────────────────────────────────
+    # ── 页面等待与深度过盾 ────────────────────────────────────
+    def handle_turnstile_if_present(self, timeout=20):
+        """参考 grok-auto-reg 的深度过盾机制：
+        1. 监控 input[name='cf-turnstile-response'] token 长度是否 > 20（金标准成功判定）；
+        2. 注入带随机 screenX/screenY 坐标伪造的 Shadow-DOM 穿透点击脚本；
+        3. 配合 Selenium 跨 iframe / shadowRoot 穿透兜底；
+        4. 配合已加载的 turnstilePatch 扩展在 document_start 自动伪装与点击。
+        """
+        if not self.d:
+            return False
+
+        # 0. 快速检测 cf-turnstile-response 是否已有 Token（成功放行）
+        try:
+            for r_inp in self.d.find_elements(By.CSS_SELECTOR, "input[name='cf-turnstile-response']"):
+                val = (r_inp.get_attribute("value") or "").strip()
+                if len(val) > 20:
+                    return True
+        except Exception:
+            pass
+
+        try:
+            cur_title = (self.d.title or "").lower()
+            page_src = (self.d.page_source or "").lower()
+        except Exception:
+            return False
+
+        is_cf = (
+            any(k in cur_title for k in ("just a moment", "attention required", "cloudflare"))
+            or "challenges.cloudflare.com" in page_src
+            or "cf-turnstile" in page_src
+            or "verify you are human" in page_src
+            or "确认您是真人" in page_src
+            or "请确认您是真人" in page_src
+        )
+        if not is_cf:
+            return False
+
+        log("🛡️ 检测到 Cloudflare Turnstile 质询，执行深度过盾...")
+        deadline = time.time() + timeout
+        clicked = False
+
+        # 核心 JS 穿透脚本（带随机屏幕坐标伪造）
+        spoof_click_js = """
+        function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+        function spoofCoords() {
+            try {
+                let sx = getRandomInt(800, 1200);
+                let sy = getRandomInt(400, 700);
+                Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx, configurable: true });
+                Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy, configurable: true });
+            } catch(e) {}
+        }
+        try {
+            const inp = document.querySelector("input[name='cf-turnstile-response']");
+            if (inp && inp.parentElement) {
+                const root = inp.parentElement.shadowRoot;
+                if (root) {
+                    const iframe = root.querySelector("iframe");
+                    if (iframe && iframe.contentDocument) {
+                        spoofCoords();
+                        const bodySr = iframe.contentDocument.body ? iframe.contentDocument.body.shadowRoot : null;
+                        const btn = bodySr ? bodySr.querySelector("input[type='checkbox'], input") : null;
+                        if (btn) { btn.click(); return "shadow_btn"; }
+                    }
+                }
+            }
+        } catch(e) {}
+        try {
+            const iframes = Array.from(document.querySelectorAll("iframe")).filter(f => {
+                const s = (f.src || "") + " " + (f.title || "");
+                return s.toLowerCase().includes("cloudflare") || s.toLowerCase().includes("turnstile");
+            });
+            for (const iframe of iframes) {
+                try {
+                    if (iframe.contentDocument) {
+                        spoofCoords();
+                        const bodySr = iframe.contentDocument.body ? iframe.contentDocument.body.shadowRoot : null;
+                        const btn = bodySr ? bodySr.querySelector("input[type='checkbox'], input") : null;
+                        if (btn) { btn.click(); return "iframe_body_shadow"; }
+                        const chk = iframe.contentDocument.querySelector("input[type='checkbox'], .ctp-checkbox-label, .mark");
+                        if (chk) { chk.click(); return "iframe_chk"; }
+                    }
+                } catch(e_f) {}
+            }
+        } catch(e_all_f) {}
+        try {
+            const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
+                const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute('src') || '');
+                return String(txt).toLowerCase().includes('turnstile');
+            });
+            if (nodes.length && typeof nodes[0].click === 'function') {
+                spoofCoords();
+                nodes[0].click();
+                return "container";
+            }
+        } catch(e2) {}
+        return "none";
+        """
+
+        while time.time() < deadline:
+            # 1. 检测 cf-turnstile-response 是否已有 Token（成功放行金标准）
+            try:
+                for r_inp in self.d.find_elements(By.CSS_SELECTOR, "input[name='cf-turnstile-response']"):
+                    val = (r_inp.get_attribute("value") or "").strip()
+                    if len(val) > 20:
+                        log(f"  ✅ Cloudflare Turnstile 验证通过 (token len={len(val)})")
+                        return True
+            except Exception:
+                pass
+
+            # 2. 执行坐标伪造与 Shadow-DOM 穿透 JS
+            try:
+                res = self.d.execute_script(spoof_click_js)
+                if res != "none" and not clicked:
+                    log(f"  已通过 JS 穿透点击 Turnstile ({res})")
+                    clicked = True
+            except Exception:
+                pass
+
+            # 3. Selenium 层跨 frame 模拟点击兜底
+            try:
+                self.d.switch_to.default_content()
+                frames = self.d.find_elements(
+                    By.CSS_SELECTOR,
+                    "iframe[src*='challenges.cloudflare.com'], iframe[title*='cloudflare' i], iframe[title*='turnstile' i]"
+                )
+                for frame in frames:
+                    try:
+                        if not frame.is_displayed():
+                            continue
+                        self.d.switch_to.frame(frame)
+                        for sel in ("input[type='checkbox']", ".ctp-checkbox-label", "#challenge-stage", "label"):
+                            for el in self.d.find_elements(By.CSS_SELECTOR, sel):
+                                try:
+                                    if el.is_displayed():
+                                        ActionChains(self.d).move_to_element(el).click().perform()
+                                        if not clicked:
+                                            log("  已通过 ActionChains 点击 Turnstile 复选框")
+                                            clicked = True
+                                        time.sleep(2)
+                                        break
+                                except Exception:
+                                    pass
+                        self.d.switch_to.default_content()
+                    except Exception:
+                        try: self.d.switch_to.default_content()
+                        except: pass
+            except Exception:
+                try: self.d.switch_to.default_content()
+                except: pass
+
+            time.sleep(1.5)
+
+            # 4. 检查页面是否已脱离挑战页（URL 跳转或标题恢复）
+            try:
+                title = (self.d.title or "").lower()
+                src = (self.d.page_source or "").lower()
+                if not any(k in title for k in ("just a moment", "attention required")) and "challenges.cloudflare.com" not in src:
+                    log("  ✅ 挑战页已重定向放行")
+                    return True
+            except Exception:
+                pass
+
+        log("  ⚠️ Cloudflare 验证暂未返回 Token，继续尝试后续步骤", "warn")
+        return False
+
     def wait_ready(self, timeout=10):
-        """等页面完全加载"""
+        """等页面完全加载，并自动处理人机验证"""
         try:
             WebDriverWait(self.d, timeout).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
         except TimeoutException: pass
+        self.handle_turnstile_if_present(timeout=10)
         time.sleep(1)
 
     def wait_url_contains(self, keyword, timeout=30):
@@ -347,9 +520,12 @@ class SignupBot:
                 page_text = (self.d.find_element(By.TAG_NAME, "body").text or "").lower()
             except Exception:
                 page_text = ""
+            if any(signal in page_text for signal in ("verify you are human", "captcha", "人机验证", "确认您是真人")):
+                if self.handle_turnstile_if_present(timeout=8):
+                    time.sleep(2)
+                    continue
+
             for signal, description in (
-                ("verify you are human", "人机验证"),
-                ("captcha", "验证码挑战"),
                 ("access denied", "访问被拒绝"),
                 ("unusual activity", "异常活动风控"),
                 ("too many requests", "请求过于频繁"),
@@ -894,39 +1070,36 @@ class SignupBot:
                     log("  从头开始注册，邮箱按需延迟创建", "warn")
                     continue
 
-            # ═══ Part 2: OAuth（同一浏览器，保持登录态）═══
+            # ═══ Part 2: OAuth（全新干净会话，避免旧会话冲突触发 Oops）═══
             oa_url, oauth_context = self._start_oauth()
             oa_state = oauth_context["state"]
             log(f"🔗 OAuth ({OAUTH_TARGET}): {oa_state}")
 
+            # 隔离注册旧会话，重置浏览器环境（对齐手动导入的独立登录环境）
+            log("  隔离注册阶段旧会话，重置浏览器环境...")
+            self.close_browser()
+            self.launch()
+
             self.d.get(oa_url)
-            time.sleep(8)
+            time.sleep(6)
             log(f"OAuth: {self.d.title} | {self.d.current_url[:80]}")
+            self.click_optional("Accept all", wait_seconds=3)
 
-            url = self.d.current_url
+            # 若未直接重定向回调，则走标准凭证登录
+            if not self._is_oauth_callback(self.d.current_url):
+                if "choose-an-account" in self.d.current_url.lower():
+                    self._step("选账户", lambda: self._click_account_button())
 
-            # 已登录 → 可能直接到 choose-account 或 consent
-            if "choose-an-account" in url:
-                self._step("选账户", lambda: self._click_account_button())
+                if not self._is_oauth_callback(self.d.current_url) and "consent" not in self.d.current_url.lower():
+                    self._step("OAuth手机号展开", lambda: self._ensure_phone_login_input())
+                    self._step("OAuth手机号", lambda: self._fill_oauth_phone_if_needed(full_phone))
+                    log(f"  → {self.d.title}")
 
-            elif "log-in" in url:
-                # prompt=login 强制重新验证
-                self._step("OAuth手机号", lambda: (
-                    self.d.get("https://auth.openai.com/log-in?usernameKind=phone_number"),
-                    time.sleep(5),
-                    self.fill_any(PHONE_INPUT_SELECTORS, full_phone),
-                    self.click("Continue"), time.sleep(5)
-                ))
-                log(f"  → {self.d.title}")
+                    self._step("OAuth密码", lambda: self._fill_oauth_password_if_needed(PW))
+                    log(f"  → {self.d.title}")
 
-                self._step("OAuth密码", lambda: (
-                    self.fill_any(["input[type=password]", "input[name=current-password]"], PW),
-                    self.click("Continue"), time.sleep(5)
-                ))
-                log(f"  → {self.d.title}")
-
-            # 绑定邮箱：进入此分支才真正创建/确认邮箱（幂等，_step 重试不会重复建）
-            if "add-email" in self.d.current_url.lower():
+            # 绑定邮箱：若页面要求绑定邮箱（URL 包含 add-email 或存在邮箱输入框）
+            if self._wait_and_check_email_step(timeout=8):
                 email = self.ensure_email()
                 log(f"  邮箱: {email}")
                 self._step("绑定邮箱", lambda: (
@@ -940,14 +1113,19 @@ class SignupBot:
                 log(f"  邮箱码: {code2}")
 
                 self._step("邮箱验证", lambda: (
-                    self.fill("input[name=code]", code2),
+                    self.fill_any([
+                        "input[name=code]",
+                        "input[autocomplete='one-time-code']",
+                        "input[inputmode='numeric']"
+                    ], code2),
                     self.click("Continue"), time.sleep(5)
                 ))
                 log(f"  → {self.d.title}")
 
-            # 授权
-            log(f"授权页: {self.d.title}")
-            self._step("授权", self.approve_oauth_consent)
+            # 授权：若未完成回调，在 consent 授权页确认
+            if not self._is_oauth_callback(self.d.current_url):
+                log(f"授权页: {self.d.title}")
+                self._step("授权", self.approve_oauth_consent)
 
             # ═══ Part 3: 捕获 OAuth 回调并交给当前导入目标 ═══
             callback_url = ""
@@ -1012,7 +1190,16 @@ class SignupBot:
         return False
 
     def _click_account_button(self):
-        """choose-account 页面：点第一个账户"""
+        """choose-account 页面：优先切换为独立登录，或点击已有账户"""
+        other_btn = self._find_button(("Use another account", "使用其他账户", "使用其他账号", "Log in with a different account"))
+        if other_btn:
+            try:
+                log(f"  choose-account 切换为独立登录: {other_btn.text.strip()[:50]}")
+                ActionChains(self.d).move_to_element(other_btn).click().perform()
+                time.sleep(3)
+                return
+            except Exception:
+                pass
         for b in self.d.find_elements(By.TAG_NAME, "button"):
             try:
                 bt = (b.text or "").strip()
@@ -1023,6 +1210,74 @@ class SignupBot:
                     return
             except: pass
         raise StepError("找不到账户按钮")
+
+    def _ensure_phone_login_input(self):
+        """确保当前登录页展示手机号输入框"""
+        self.wait_ready(timeout=5)
+        if self._is_oauth_callback(self.d.current_url):
+            return
+        for pw_sel in ("input[name='password']", "input[name='current-password']", "input[type='password']"):
+            for el in self.d.find_elements(By.CSS_SELECTOR, pw_sel):
+                try:
+                    if el.is_displayed():
+                        return
+                except Exception:
+                    pass
+        for sel in PHONE_INPUT_SELECTORS:
+            for inp in self.d.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if inp.is_displayed():
+                        return
+                except Exception:
+                    pass
+        self.click_optional("Continue with phone", wait_seconds=3)
+        time.sleep(2)
+
+    def _fill_oauth_phone_if_needed(self, full_phone):
+        """填入 OAuth 登录手机号，已在密码页时自动略过"""
+        if self._is_oauth_callback(self.d.current_url):
+            return
+        for pw_sel in ("input[name='password']", "input[name='current-password']", "input[type='password']"):
+            for el in self.d.find_elements(By.CSS_SELECTOR, pw_sel):
+                try:
+                    if el.is_displayed():
+                        return
+                except Exception:
+                    pass
+        self.fill_any(PHONE_INPUT_SELECTORS, full_phone)
+        self.click("Continue")
+        time.sleep(4)
+
+    def _fill_oauth_password_if_needed(self, password):
+        """填入 OAuth 密码"""
+        if self._is_oauth_callback(self.d.current_url) or "consent" in self.d.current_url.lower():
+            return
+        self.fill_any([
+            "input[name='password']",
+            "input[name='current-password']",
+            "input[autocomplete='current-password']",
+            "input[type='password']"
+        ], password)
+        self.click("Continue")
+        time.sleep(5)
+
+    def _wait_and_check_email_step(self, timeout=8):
+        """检测提交密码后是否需要补绑邮箱"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._is_oauth_callback(self.d.current_url):
+                return False
+            url = self.d.current_url.lower()
+            if "add-email" in url:
+                return True
+            try:
+                for el in self.d.find_elements(By.CSS_SELECTOR, "input[type='email'], input[name='email']"):
+                    if el.is_displayed():
+                        return True
+            except Exception:
+                pass
+            time.sleep(1)
+        return False
 
 # ── 入口 ────────────────────────────────────────────────
 if __name__ == "__main__":
