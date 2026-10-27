@@ -481,6 +481,48 @@ class SignupBot:
         detail = f": {last_state}" if last_state else ""
         raise StepError(f"未找到可点击的姓名年龄提交按钮{detail}")
 
+    def submit_about_you_and_wait(self, timeout=25):
+        """填写并提交姓名年龄，严格等待离开 about-you 且确保不处于错误页"""
+        full_name = NAME.strip()
+        if " " not in full_name:
+            full_name = f"{full_name.capitalize()} Taylor"
+
+        for attempt in range(MAX_RETRIES):
+            self.wait_ready()
+            if self.is_error_page():
+                log("  [姓名年龄] 检测到错误页，刷新重试...", "warn")
+                self.d.refresh()
+                time.sleep(6)
+                continue
+
+            cur_url = self.d.current_url.lower()
+            cur_title = (self.d.title or "").lower()
+            if "about-you" not in cur_url and "how old are you" not in cur_title and not self.is_error_page():
+                return
+
+            self.fill_any(["input[name='name']", "input[autocomplete='name']"], full_name)
+            self.fill_birth_year(AGE)
+            time.sleep(1)
+            self.click_about_you_submit()
+
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                self.wait_ready(timeout=2)
+                cur_url = self.d.current_url.lower()
+                cur_title = (self.d.title or "").lower()
+                if self.is_error_page():
+                    log(f"  [姓名年龄] 提交后出现错误页 ({self.d.title})，刷新重试...", "warn")
+                    self.d.refresh()
+                    time.sleep(6)
+                    break
+                if "about-you" not in cur_url and "how old are you" not in cur_title:
+                    log(f"  ✅ 姓名年龄提交成功，已离开资料页: {self.d.title}")
+                    return
+                time.sleep(1)
+
+        if "about-you" in self.d.current_url.lower() or "how old are you" in (self.d.title or "").lower() or self.is_error_page():
+            raise StepError(f"姓名年龄提交未成功: {self.d.title}")
+
     def click_optional(self, text, wait_seconds=5):
         """点击可选按钮；不存在或点不了时跳过，不阻断流程。"""
         deadline = time.time() + wait_seconds
@@ -515,6 +557,14 @@ class SignupBot:
         while time.time() < deadline:
             if self._is_oauth_callback(self.d.current_url):
                 return
+
+            cur_url = self.d.current_url.lower()
+            cur_title = (self.d.title or "").lower()
+            if "about-you" in cur_url or "how old are you" in cur_title:
+                log("  [授权] 当前停留在资料补填页 (about-you)，自动执行补填...", "warn")
+                self.submit_about_you_and_wait()
+                time.sleep(2)
+                continue
 
             try:
                 page_text = (self.d.find_element(By.TAG_NAME, "body").text or "").lower()
@@ -577,7 +627,7 @@ class SignupBot:
         raise StepError(f"OAuth 授权页未找到授权按钮；可见按钮: {labels[:300]}")
 
     def fill(self, selector, value, retries=MAX_RETRIES):
-        """填输入框"""
+        """填输入框，原生模拟输入与 React Aria 受控组件事件双派发"""
         for attempt in range(retries):
             self.wait_ready()
             try:
@@ -586,7 +636,27 @@ class SignupBot:
                 time.sleep(0.2)
                 try: el.clear()
                 except: pass
-                for ch in value: el.send_keys(ch); time.sleep(0.03)
+                for ch in str(value): el.send_keys(ch); time.sleep(0.03)
+
+                # 兼容 React Aria / Controlled Component: 强制调用 Native Setter 并派发事件
+                try:
+                    self.d.execute_script("""
+                        const el = arguments[0];
+                        const val = arguments[1];
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value') ?
+                            Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set : null;
+                        if (setter) {
+                            setter.call(el, val);
+                        } else {
+                            el.value = val;
+                        }
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    """, el, str(value))
+                except Exception:
+                    pass
+
                 log(f"  填入: {value}")
                 return
             except Exception as e:
@@ -904,12 +974,7 @@ class SignupBot:
         time.sleep(3)
         log(f"→ {self.d.title}")
 
-        self._step("姓名年龄", lambda: (
-            self.fill("input[name=name]", NAME),
-            self.fill_birth_year(AGE),
-            self.click_about_you_submit()
-        ))
-        time.sleep(8)
+        self._step("姓名年龄", self.submit_about_you_and_wait)
         log(f"✅ 注册完成: {self.d.title}")
         return full_phone
 
@@ -1098,6 +1163,12 @@ class SignupBot:
                     self._step("OAuth密码", lambda: self._fill_oauth_password_if_needed(PW))
                     log(f"  → {self.d.title}")
 
+            # 补填资料：若密码提交后进入 How old are you? / about-you
+            if self._wait_and_check_about_you_step(timeout=8):
+                log("  检测到需要补填姓名年龄资料 (How old are you?)")
+                self._step("补填姓名年龄", self.submit_about_you_and_wait)
+                log(f"  → {self.d.title}")
+
             # 绑定邮箱：若页面要求绑定邮箱（URL 包含 add-email 或存在邮箱输入框）
             if self._wait_and_check_email_step(timeout=8):
                 email = self.ensure_email()
@@ -1260,6 +1331,25 @@ class SignupBot:
         ], password)
         self.click("Continue")
         time.sleep(5)
+
+    def _wait_and_check_about_you_step(self, timeout=8):
+        """检测提交密码后是否要求补填姓名年龄资料"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._is_oauth_callback(self.d.current_url):
+                return False
+            url = self.d.current_url.lower()
+            title = (self.d.title or "").lower()
+            if "about-you" in url or "how old are you" in title:
+                return True
+            try:
+                for el in self.d.find_elements(By.CSS_SELECTOR, "form[action*='/about-you'], input[name='name']"):
+                    if el.is_displayed():
+                        return True
+            except Exception:
+                pass
+            time.sleep(1)
+        return False
 
     def _wait_and_check_email_step(self, timeout=8):
         """检测提交密码后是否需要补绑邮箱"""
